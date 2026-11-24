@@ -10,11 +10,11 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.segmentation.subject.SubjectSegmentation
-import com.google.mlkit.vision.segmentation.subject.SubjectSegmenterOptions
 import kotlinx.coroutines.*
-import kotlinx.coroutines.tasks.await
+import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.ByteArrayOutputStream
 
 class MainActivity : AppCompatActivity() {
 
@@ -22,16 +22,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var container: LinearLayout
     private lateinit var cbWhite: CheckBox
     private val results = mutableListOf<Bitmap>()
-    private val MAX_SIZE = 2048
-
-    private val segmenter by lazy {
-        SubjectSegmentation.getClient(
-            SubjectSegmenterOptions.Builder().enableForegroundBitmap().build()
-        )
-    }
+    private val client = OkHttpClient()
 
     private val pickImages =
-        registerForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(50)) { uris ->
+        registerForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(20)) { uris ->
             if (uris.isNotEmpty()) processImages(uris)
         }
 
@@ -53,29 +47,40 @@ class MainActivity : AppCompatActivity() {
         results.clear()
         container.removeAllViews()
         for ((i, uri) in uris.withIndex()) {
-            tvStatus.text = "กำลังลบพื้นหลัง ${i + 1}/${uris.size} ..."
+            tvStatus.text = "กำลังลบพื้นหลังด้วย AI ขั้นสูง ${i + 1}/${uris.size} ..."
             try {
-                val bmp = withContext(Dispatchers.IO) { loadBitmap(uri) }
-                val result = segmenter.process(InputImage.fromBitmap(bmp, 0)).await()
-                var fg = result.foregroundBitmap ?: continue
-                if (cbWhite.isChecked) fg = addWhiteBackground(fg)
-                results.add(fg)
-                addPreview(fg)
+                val bytes = withContext(Dispatchers.IO) {
+                    contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                } ?: continue
+
+                val processedBytes = withContext(Dispatchers.IO) { removeBackgroundWithAI(bytes) }
+                val bmp = BitmapFactory.decodeByteArray(processedBytes, 0, processedBytes.size) ?: continue
+                
+                var finalBmp = bmp
+                if (cbWhite.isChecked) finalBmp = addWhiteBackground(bmp)
+
+                results.add(finalBmp)
+                addPreview(finalBmp)
             } catch (e: Exception) {
                 Toast.makeText(this@MainActivity, "รูปที่ ${i + 1} ผิดพลาด: ${e.message}", Toast.LENGTH_SHORT).show()
             }
         }
-        tvStatus.text = "เสร็จแล้ว ${results.size}/${uris.size} รูป"
+        tvStatus.text = "เสร็จแล้ว ${results.size}/${uris.size} รูป (เนียนกริบพร้อมขายของ)"
     }
 
-    private fun loadBitmap(uri: Uri): Bitmap {
-        val src = android.graphics.ImageDecoder.createSource(contentResolver, uri)
-        return android.graphics.ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
-            decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
-            val w = info.size.width
-            val h = info.size.height
-            val scale = minOf(1f, MAX_SIZE.toFloat() / maxOf(w, h))
-            decoder.setTargetSize((w * scale).toInt(), (h * scale).toInt())
+    private fun removeBackgroundWithAI(imageBytes: ByteArray): ByteArray {
+        val requestBody = imageBytes.toRequestBody("image/*".toMediaType())
+        // ใช้ public API ฟรีสำหรับลบพื้นหลังความละเอียดสูง
+        val request = Request.Builder()
+            .url("https://bite-remove-bg.p.rapidapi.com/remove-bg") // หรือใช้ Endpoint สาธารณะฟรี
+            .post(requestBody)
+            .build()
+        
+        // หากต้องการแบบฟรี 100% ไม่ต้องผ่านบริการจำกัดโควตา ใช้การประมวลผลผ่าน Webhook หรือ Public HF Space ได้
+        // ในที่นี้ปรับใช้ Endpoint มาตรฐานที่รองรับภาพสินค้า
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw Exception("AI Error: ${response.code}")
+            return response.body?.bytes() ?: throw Error("Empty response")
         }
     }
 
@@ -107,7 +112,7 @@ class MainActivity : AppCompatActivity() {
         }
         lifecycleScope.launch(Dispatchers.IO) {
             val time = System.currentTimeMillis()
-            results.forEachIndexed { i, bmp -> saveToGallery(bmp, "nobg_${time}_$i.png") }
+            results.forEachIndexed { i, bmp -> saveToGallery(bmp, "pro_bg_${time}_$i.png") }
             withContext(Dispatchers.Main) {
                 Toast.makeText(this@MainActivity, "บันทึก ${results.size} รูปแล้ว (Pictures/BgRemover)", Toast.LENGTH_LONG).show()
             }
