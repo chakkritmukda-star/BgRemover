@@ -1,5 +1,8 @@
 package com.example.bgremover
 
+import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
 import android.content.ContentValues
 import android.graphics.*
 import android.net.Uri
@@ -11,10 +14,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.*
-import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.ByteArrayOutputStream
+import java.io.File
+import java.nio.FloatBuffer
 
 class MainActivity : AppCompatActivity() {
 
@@ -22,11 +23,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var container: LinearLayout
     private lateinit var cbWhite: CheckBox
     private val results = mutableListOf<Bitmap>()
-    private val client = OkHttpClient()
+    private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
+    private var session: OrtSession? = null
+    private val SIZE = 1024
+    private val MAX_OUT = 2048
+    private var busy = false
 
     private val pickImages =
-        registerForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(20)) { uris ->
-            if (uris.isNotEmpty()) processImages(uris)
+        registerForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(30)) { uris ->
+            if (uris.isNotEmpty() && !busy) processImages(uris)
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -38,50 +43,128 @@ class MainActivity : AppCompatActivity() {
         cbWhite = findViewById(R.id.cbWhite)
 
         findViewById<Button>(R.id.btnPick).setOnClickListener {
-            pickImages.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            if (busy) {
+                Toast.makeText(this, "กำลังทำงานอยู่ รอสักครู่", Toast.LENGTH_SHORT).show()
+            } else {
+                pickImages.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            }
         }
         findViewById<Button>(R.id.btnSave).setOnClickListener { saveAll() }
     }
 
+    private suspend fun getSession(): OrtSession = withContext(Dispatchers.IO) {
+        session ?: run {
+            val file = File(filesDir, "model.onnx")
+            if (!file.exists() || file.length() == 0L) {
+                val tmp = File(filesDir, "model.tmp")
+                assets.open("model.onnx").use { input ->
+                    tmp.outputStream().use { input.copyTo(it) }
+                }
+                tmp.renameTo(file)
+            }
+            val opts = OrtSession.SessionOptions().apply { setIntraOpNumThreads(4) }
+            env.createSession(file.absolutePath, opts).also { session = it }
+        }
+    }
+
     private fun processImages(uris: List<Uri>) = lifecycleScope.launch {
+        busy = true
         results.clear()
         container.removeAllViews()
+        val white = cbWhite.isChecked
+
+        tvStatus.text = "กำลังเตรียม AI (ครั้งแรกอาจใช้เวลา 10-30 วินาที)..."
+        val s = try {
+            getSession()
+        } catch (e: Exception) {
+            tvStatus.text = "โหลด AI ไม่สำเร็จ: ${e.message}"
+            busy = false
+            return@launch
+        }
+
         for ((i, uri) in uris.withIndex()) {
-            tvStatus.text = "กำลังลบพื้นหลังด้วย AI ขั้นสูง ${i + 1}/${uris.size} ..."
+            tvStatus.text = "กำลังลบพื้นหลัง ${i + 1}/${uris.size} ..."
             try {
-                val bytes = withContext(Dispatchers.IO) {
-                    contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                } ?: continue
-
-                val processedBytes = withContext(Dispatchers.IO) { removeBackgroundWithAI(bytes) }
-                val bmp = BitmapFactory.decodeByteArray(processedBytes, 0, processedBytes.size) ?: continue
-                
-                var finalBmp = bmp
-                if (cbWhite.isChecked) finalBmp = addWhiteBackground(bmp)
-
-                results.add(finalBmp)
-                addPreview(finalBmp)
-            } catch (e: Exception) {
+                val out = withContext(Dispatchers.Default) {
+                    val src = loadBitmap(uri)
+                    val cut = removeBg(s, src)
+                    if (white) addWhiteBackground(cut) else cut
+                }
+                results.add(out)
+                addPreview(out)
+            } catch (e: Throwable) {
                 Toast.makeText(this@MainActivity, "รูปที่ ${i + 1} ผิดพลาด: ${e.message}", Toast.LENGTH_SHORT).show()
             }
         }
-        tvStatus.text = "เสร็จแล้ว ${results.size}/${uris.size} รูป (เนียนกริบพร้อมขายของ)"
+        tvStatus.text = "เสร็จแล้ว ${results.size}/${uris.size} รูป กดบันทึกได้เลย"
+        busy = false
     }
 
-    private fun removeBackgroundWithAI(imageBytes: ByteArray): ByteArray {
-        val requestBody = imageBytes.toRequestBody("image/*".toMediaType())
-        // ใช้ public API ฟรีสำหรับลบพื้นหลังความละเอียดสูง
-        val request = Request.Builder()
-            .url("https://bite-remove-bg.p.rapidapi.com/remove-bg") // หรือใช้ Endpoint สาธารณะฟรี
-            .post(requestBody)
-            .build()
-        
-        // หากต้องการแบบฟรี 100% ไม่ต้องผ่านบริการจำกัดโควตา ใช้การประมวลผลผ่าน Webhook หรือ Public HF Space ได้
-        // ในที่นี้ปรับใช้ Endpoint มาตรฐานที่รองรับภาพสินค้า
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) throw Exception("AI Error: ${response.code}")
-            return response.body?.bytes() ?: throw Error("Empty response")
+    private fun loadBitmap(uri: Uri): Bitmap {
+        val src = ImageDecoder.createSource(contentResolver, uri)
+        return ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
+            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+            val w = info.size.width
+            val h = info.size.height
+            val scale = minOf(1f, MAX_OUT.toFloat() / maxOf(w, h))
+            decoder.setTargetSize((w * scale).toInt(), (h * scale).toInt())
+        }.copy(Bitmap.Config.ARGB_8888, false)
+    }
+
+    private fun removeBg(s: OrtSession, src: Bitmap): Bitmap {
+        val w = src.width
+        val h = src.height
+        val area = SIZE * SIZE
+
+        // เตรียมภาพเข้า AI (1024x1024)
+        val scaled = Bitmap.createScaledBitmap(src, SIZE, SIZE, true)
+        val px = IntArray(area)
+        scaled.getPixels(px, 0, SIZE, 0, 0, SIZE, SIZE)
+        val buf = FloatBuffer.allocate(3 * area)
+        val arr = buf.array()
+        for (k in 0 until area) {
+            val c = px[k]
+            arr[k] = ((c shr 16) and 0xFF) / 255f - 0.5f
+            arr[area + k] = ((c shr 8) and 0xFF) / 255f - 0.5f
+            arr[2 * area + k] = (c and 0xFF) / 255f - 0.5f
         }
+
+        // ให้ AI สร้าง mask
+        val inputName = s.inputNames.iterator().next()
+        val mask: FloatArray = OnnxTensor.createTensor(
+            env, buf, longArrayOf(1, 3, SIZE.toLong(), SIZE.toLong())
+        ).use { t ->
+            s.run(mapOf(inputName to t)).use { r ->
+                val fb = (r.get(0) as OnnxTensor).floatBuffer
+                FloatArray(fb.remaining()).also { fb.get(it) }
+            }
+        }
+
+        // ปรับค่า mask เป็น 0-255
+        var mn = Float.MAX_VALUE
+        var mx = -Float.MAX_VALUE
+        for (v in mask) {
+            if (v < mn) mn = v
+            if (v > mx) mx = v
+        }
+        val range = (mx - mn).coerceAtLeast(1e-6f)
+        val maskPx = IntArray(area)
+        for (k in 0 until area) {
+            val a = (((mask[k] - mn) / range) * 255f).toInt().coerceIn(0, 255)
+            maskPx[k] = a shl 24
+        }
+        val maskSmall = Bitmap.createBitmap(maskPx, SIZE, SIZE, Bitmap.Config.ARGB_8888)
+        val maskFull = Bitmap.createScaledBitmap(maskSmall, w, h, true)
+
+        // ตัดพื้นหลังออกตาม mask
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawBitmap(src, 0f, 0f, null)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
+        }
+        canvas.drawBitmap(maskFull, 0f, 0f, p)
+        return out
     }
 
     private fun addWhiteBackground(src: Bitmap): Bitmap {
@@ -112,7 +195,7 @@ class MainActivity : AppCompatActivity() {
         }
         lifecycleScope.launch(Dispatchers.IO) {
             val time = System.currentTimeMillis()
-            results.forEachIndexed { i, bmp -> saveToGallery(bmp, "pro_bg_${time}_$i.png") }
+            results.forEachIndexed { i, bmp -> saveToGallery(bmp, "nobg_${time}_$i.png") }
             withContext(Dispatchers.Main) {
                 Toast.makeText(this@MainActivity, "บันทึก ${results.size} รูปแล้ว (Pictures/BgRemover)", Toast.LENGTH_LONG).show()
             }
