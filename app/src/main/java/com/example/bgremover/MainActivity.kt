@@ -69,9 +69,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadBitmap(uri: Uri): Bitmap {
-        val src = ImageDecoder.createSource(contentResolver, uri)
-        return ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
-            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+        val src = android.graphics.ImageDecoder.createSource(contentResolver, uri)
+        return android.graphics.ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
+            decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
             val w = info.size.width
             val h = info.size.height
             val scale = minOf(1f, MAX_SIZE.toFloat() / maxOf(w, h))
