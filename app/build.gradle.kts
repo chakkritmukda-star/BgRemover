@@ -11,8 +11,15 @@ android {
         applicationId = "com.example.bgremover"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "2.0"
+        ndk {
+            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
+        }
+    }
+
+    androidResources {
+        noCompress.add("onnx")
     }
 
     compileOptions {
@@ -28,5 +35,5 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.activity:activity-ktx:1.9.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.3")
 }
