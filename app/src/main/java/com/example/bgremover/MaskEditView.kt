@@ -8,17 +8,16 @@ import android.view.View
 import java.util.ArrayDeque
 import kotlin.math.abs
 import kotlin.math.hypot
-import kotlin.math.max
 import kotlin.math.min
 
 class MaskEditView(context: Context) : View(context) {
 
     enum class Mode {
-        MAGIC_ERASER,    // ✨ ลบวัตถุแล้วเติมพื้นหลังเนียนแบบ Photoroom (MI-GAN AI Inpainting)
-        ERASE_MANUAL,    // 🧹 ระบายเจาะพื้นหลังให้ใส
-        RESTORE_MANUAL,  // 🖌️ กู้คืนพื้นหลังกลับมา
-        SMART_CUTOUT,    // 🪄 ลบสีพื้นหลังใกล้เคียงอัตโนมัติ (ไม่ไหลทะลุตัวคน)
-        PAN              // 🖐 เลื่อนและซูม 2 นิ้ว
+        MAGIC_ERASER,
+        ERASE_MANUAL,
+        RESTORE_MANUAL,
+        SMART_CUTOUT,
+        PAN
     }
 
     private data class HistorySnapshot(
@@ -136,10 +135,8 @@ class MaskEditView(context: Context) : View(context) {
         val h = original.height
         initialOriginalBmp = original.copy(Bitmap.Config.ARGB_8888, false)
 
-        // เตรียมภาพสีและเลเยอร์ความโปร่งใสแยกจากกันอย่างสะอาด
         if (hasBgRemoved) {
             workingColorBmp = original.copy(Bitmap.Config.ARGB_8888, true)
-            // คัดลอกค่าสีที่อาจเคยถูก Magic Eraser แก้ไว้ใน currentResult (เฉพาะพิกเซลที่ไม่ใสสนิท)
             val origPx = IntArray(w * h)
             val curPx = IntArray(w * h)
             val alphaPx = IntArray(w * h)
@@ -159,7 +156,7 @@ class MaskEditView(context: Context) : View(context) {
         } else {
             workingColorBmp = currentResult.copy(Bitmap.Config.ARGB_8888, true)
             alphaMaskBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
-                eraseColor(Color.BLACK) // ทึบ 100% ทั้งภาพ
+                eraseColor(Color.BLACK)
             }
         }
 
@@ -286,7 +283,6 @@ class MaskEditView(context: Context) : View(context) {
         }
         canvas.restoreToCount(saveLayer)
 
-        // วาดวงกลมแสดงตำแหน่งแปรงขณะลากนิ้ว + แว่นขยายมุมบนซ้าย
         if (isDrawingStroke && mode != Mode.PAN) {
             canvas.drawCircle(lastTouchX, lastTouchY, brushRadiusScreen, paintBrushFill)
             canvas.drawCircle(lastTouchX, lastTouchY, brushRadiusScreen, paintBrushRing)
@@ -390,7 +386,7 @@ class MaskEditView(context: Context) : View(context) {
         val pt = floatArrayOf(event.x, event.y)
         invMatrix.mapPoints(pt)
         val imgX = pt[0]
-        val imgY = pt
+        val imgY = pt[1]
         val strokeWidthImg = (brushRadiusScreen * 2f) / currentScale()
 
         paintEraseAlpha.strokeWidth = strokeWidthImg
@@ -471,9 +467,6 @@ class MaskEditView(context: Context) : View(context) {
         }
     }
 
-    /**
-     * ลบเฉพาะโทนสีที่ใกล้เคียงกับจุดที่ระบาย (Seed Color Flood-Fill) ป้องกันสีไหลทะลุตัวคน
-     */
     private fun applySeedColorCutout() {
         val colorBmp = workingColorBmp ?: return
         val maskBmp = alphaMaskBmp ?: return
@@ -486,81 +479,4 @@ class MaskEditView(context: Context) : View(context) {
         val strokePx = IntArray(w * h)
 
         colorBmp.getPixels(colorPx, 0, w, 0, 0, w, h)
-        maskBmp.getPixels(alphaPx, 0, w, 0, 0, w, h)
-        strokeBmp.getPixels(strokePx, 0, w, 0, 0, w, h)
-
-        var sumR = 0L
-        var sumG = 0L
-        var sumB = 0L
-        var count = 0L
-        val queue = ArrayDeque<Int>()
-        val visited = BooleanArray(w * h)
-
-        for (i in strokePx.indices) {
-            if (((strokePx[i] ushr 24) and 0xFF) > 40) {
-                val c = colorPx[i]
-                sumR += (c shr 16) and 0xFF
-                sumG += (c shr 8) and 0xFF
-                sumB += c and 0xFF
-                count++
-                queue.addLast(i)
-                visited[i] = true
-            }
-        }
-        if (count == 0L) return
-
-        val seedR = (sumR / count).toInt()
-        val seedG = (sumG / count).toInt()
-        val seedB = (sumB / count).toInt()
-        val tolerance = 85
-
-        val dirs = intArrayOf(-1, 1, -w, w)
-        while (queue.isNotEmpty()) {
-            val idx = queue.removeFirst()
-            alphaPx[idx] = 0 // เจาะให้โปร่งใส
-            val cx = idx % w
-            for (d in dirs) {
-                val nIdx = idx + d
-                if (nIdx !in 0 until (w * h)) continue
-                val nx = nIdx % w
-                if (abs(cx - nx) > 1) continue
-                if (!visited[nIdx]) {
-                    val nc = colorPx[nIdx]
-                    val nr = (nc shr 16) and 0xFF
-                    val ng = (nc shr 8) and 0xFF
-                    val nb = nc and 0xFF
-                    val diff = abs(seedR - nr) + abs(seedG - ng) + abs(seedB - nb)
-                    if (diff <= tolerance) {
-                        visited[nIdx] = true
-                        queue.addLast(nIdx)
-                    }
-                }
-            }
-        }
-        maskBmp.setPixels(alphaPx, 0, w, 0, 0, w, h)
-    }
-
-    fun hasTransparency(): Boolean {
-        val maskBmp = alphaMaskBmp ?: return false
-        val w = maskBmp.width
-        val h = maskBmp.height
-        val px = IntArray(w * h)
-        maskBmp.getPixels(px, 0, w, 0, 0, w, h)
-        for (p in px) {
-            if (((p ushr 24) and 0xFF) < 250) return true
-        }
-        return false
-    }
-
-    fun getCurrentColorBitmap(): Bitmap? = workingColorBmp?.copy(Bitmap.Config.ARGB_8888, false)
-
-    fun exportFinalBitmap(): Bitmap {
-        val colorBmp = workingColorBmp!!
-        val maskBmp = alphaMaskBmp!!
-        val out = Bitmap.createBitmap(colorBmp.width, colorBmp.height, Bitmap.Config.ARGB_8888)
-        val c = Canvas(out)
-        c.drawBitmap(colorBmp, 0f, 0f, bmpPaint)
-        c.drawBitmap(maskBmp, 0f, 0f, paintMaskDstIn)
-        return out
-    }
-}
+        ma
