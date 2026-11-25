@@ -19,8 +19,10 @@ class EditorActivity : AppCompatActivity() {
 
     private lateinit var editView: MaskEditView
     private lateinit var item: Item
-    private lateinit var btnErase: Button
-    private lateinit var btnRestore: Button
+    private lateinit var btnEraseMan: Button
+    private lateinit var btnEraseAi: Button
+    private lateinit var btnRestMan: Button
+    private lateinit var btnRestAi: Button
     private lateinit var hint: TextView
     private var index = -1
     private var edited = false
@@ -60,14 +62,21 @@ class EditorActivity : AppCompatActivity() {
         }
         root.addView(editView)
 
-        val modeRow = row()
-        btnErase = btn("ลบส่วนเกิน") { setMode(false) }
-        btnRestore = btn("เติมกลับ") { setMode(true) }
-        modeRow.addView(btnErase)
-        modeRow.addView(btnRestore)
-        modeRow.addView(btn("🤖 AI เกลี่ยขอบ") { editView.smartRefine() })
-        modeRow.addView(btn("พอดีจอ") { editView.fitToView() })
-        root.addView(modeRow)
+        // แถวปุ่มเลือก 4 โหมด
+        val modeRow1 = row()
+        btnEraseMan = btn("🧹 ลบ (มือ)") { setMode(MaskEditView.Mode.ERASE_MANUAL) }
+        btnEraseAi = btn("✨ ลบ (AI)") { setMode(MaskEditView.Mode.ERASE_AI) }
+        modeRow1.addView(btnEraseMan)
+        modeRow1.addView(btnEraseAi)
+        root.addView(modeRow1)
+
+        val modeRow2 = row()
+        btnRestMan = btn("🖌️ ดึงกลับ (มือ)") { setMode(MaskEditView.Mode.RESTORE_MANUAL) }
+        btnRestAi = btn("🪄 ดึงกลับ (AI)") { setMode(MaskEditView.Mode.RESTORE_AI) }
+        modeRow2.addView(btnRestMan)
+        modeRow2.addView(btnRestAi)
+        modeRow2.addView(btn("พอดีจอ") { editView.fitToView() })
+        root.addView(modeRow2)
 
         val sizeRow = row()
         val label = TextView(this).apply {
@@ -103,7 +112,7 @@ class EditorActivity : AppCompatActivity() {
         root.addView(hint)
 
         setContentView(root)
-        setMode(false)
+        setMode(MaskEditView.Mode.ERASE_MANUAL)
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() = askDiscard()
@@ -113,7 +122,7 @@ class EditorActivity : AppCompatActivity() {
             try {
                 val pair = withContext(Dispatchers.IO) { Img.decode(item.src) to Img.decode(item.mask) }
                 editView.setImages(pair.first, pair.second)
-                setMode(editView.restoreMode)
+                setMode(editView.currentMode)
             } catch (e: Throwable) {
                 Toast.makeText(this@EditorActivity, "เปิดรูปไม่ได้: ${e.message}", Toast.LENGTH_LONG).show()
                 finish()
@@ -126,7 +135,7 @@ class EditorActivity : AppCompatActivity() {
     private fun row() = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = android.view.Gravity.CENTER_VERTICAL
-        setPadding(dp(4), dp(4), dp(4), dp(4))
+        setPadding(dp(4), dp(2), dp(4), dp(2))
     }
 
     private fun btn(label: String, onClick: () -> Unit): Button = Button(this).apply {
@@ -141,14 +150,19 @@ class EditorActivity : AppCompatActivity() {
         setOnClickListener { onClick() }
     }
 
-    private fun setMode(restore: Boolean) {
-        editView.restoreMode = restore
-        btnErase.setBackgroundColor(if (!restore) ACCENT else GRAY)
-        btnRestore.setBackgroundColor(if (restore) ACCENT else GRAY)
-        hint.text = if (restore)
-            "เติมกลับ: ระบายส่วนที่หายไป • กด AI เกลี่ยขอบเพื่อให้ AI ช่วยคำนวณ"
-        else
-            "ลบส่วนเกิน: ระบายทับอุปกรณ์สตูดิโอ/เงาที่ไม่ต้องการ • 2 นิ้ว = ซูม"
+    private fun setMode(m: MaskEditView.Mode) {
+        editView.currentMode = m
+        btnEraseMan.setBackgroundColor(if (m == MaskEditView.Mode.ERASE_MANUAL) ACCENT else GRAY)
+        btnEraseAi.setBackgroundColor(if (m == MaskEditView.Mode.ERASE_AI) ACCENT else GRAY)
+        btnRestMan.setBackgroundColor(if (m == MaskEditView.Mode.RESTORE_MANUAL) ACCENT else GRAY)
+        btnRestAi.setBackgroundColor(if (m == MaskEditView.Mode.RESTORE_AI) ACCENT else GRAY)
+
+        hint.text = when (m) {
+            MaskEditView.Mode.ERASE_MANUAL -> "🧹 ลบ (มือ): ระบายส่วนเกินออกทันทีตามนิ้ว • 2 นิ้ว = ซูม"
+            MaskEditView.Mode.ERASE_AI -> "✨ ลบ (AI): ระบายทับส่วนเกิน แล้วปล่อยนิ้วเพื่อให้ AI คำนวณลบและเกลี่ยขอบให้"
+            MaskEditView.Mode.RESTORE_MANUAL -> "🖌️ ดึงกลับ (มือ): ระบายส่วนที่หายไปให้กลับมาทันทีตามนิ้ว"
+            MaskEditView.Mode.RESTORE_AI -> "🪄 ดึงกลับ (AI): ระบายบริเวณที่ต้องการ แล้วปล่อยนิ้วให้ AI ช่วยขยายขอบเขตวัตถุ"
+        }
     }
 
     private fun resetToAi() {
@@ -198,6 +212,8 @@ class EditorActivity : AppCompatActivity() {
 @SuppressLint("ViewConstructor", "ClickableViewAccessibility")
 class MaskEditView(context: Context) : View(context) {
 
+    enum class Mode { ERASE_MANUAL, ERASE_AI, RESTORE_MANUAL, RESTORE_AI }
+
     var src: Bitmap? = null
         private set
     var mask: Bitmap? = null
@@ -206,7 +222,7 @@ class MaskEditView(context: Context) : View(context) {
     private var cutout: Bitmap? = null
     private var cutoutCanvas: Canvas? = null
 
-    var restoreMode = false
+    var currentMode = Mode.ERASE_MANUAL
         set(v) { field = v; invalidate() }
     var whiteBg = false
         set(v) { field = v; invalidate() }
@@ -226,22 +242,23 @@ class MaskEditView(context: Context) : View(context) {
 
     private val dstIn = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN) }
     private val bmpPaint = Paint(Paint.FILTER_BITMAP_FLAG)
-    private val ghostPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply { alpha = 90 }
+    private val ghostPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply { alpha = 110 }
     private val whitePaint = Paint().apply { color = Color.WHITE }
     private val checkerPaint = Paint().apply {
         shader = BitmapShader(Img.checkerTile(), Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
     }
+
     private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
-        color = Color.BLACK
     }
     private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.BLACK
     }
     private val clearMode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
+    private val srcOverMode = PorterDuffXfermode(PorterDuff.Mode.SRC_OVER)
+
     private val ringWhite = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE; strokeWidth = 5f; color = Color.WHITE
     }
@@ -333,43 +350,6 @@ class MaskEditView(context: Context) : View(context) {
         onEdited?.invoke()
     }
 
-    fun smartRefine() {
-        val m = mask ?: return
-        val s = src ?: return
-        undoStack.addLast(m.copy(Bitmap.Config.ARGB_8888, true))
-        trimUndo()
-        clearRedo()
-
-        val w = m.width
-        val h = m.height
-        val pxs = IntArray(w * h)
-        val srcPxs = IntArray(w * h)
-        m.getPixels(pxs, 0, w, 0, 0, w, h)
-        s.getPixels(srcPxs, 0, w, 0, 0, w, h)
-
-        // AI เกลี่ยขอบรอบวัตถุอัตโนมัติ (Smart Edge Blending)
-        for (y in 1 until h - 1) {
-            for (x in 1 until w - 1) {
-                val idx = y * w + x
-                val a = pxs[idx] ushr 24
-                if (a in 1..254) {
-                    var sum = 0
-                    for (dy in -1..1) {
-                        for (dx in -1..1) {
-                            sum += pxs[(y + dy) * w + (x + dx)] ushr 24
-                        }
-                    }
-                    val avg = sum / 9
-                    pxs[idx] = (avg shl 24) or 0xFFFFFF
-                }
-            }
-        }
-        m.setPixels(pxs, 0, w, 0, 0, w, h)
-        refreshAll()
-        onEdited?.invoke()
-        Toast.makeText(context, "AI เกลี่ยขอบให้เรียบร้อยแล้ว", Toast.LENGTH_SHORT).show()
-    }
-
     private fun trimUndo() {
         while (undoStack.size > MAX_UNDO) undoStack.removeFirst().recycle()
     }
@@ -423,10 +403,30 @@ class MaskEditView(context: Context) : View(context) {
         trimUndo()
         drawing = true
         val w = brushPx / curScale()
-        val mode = if (restoreMode) null else clearMode
+
+        when (currentMode) {
+            Mode.ERASE_MANUAL -> {
+                strokePaint.xfermode = clearMode
+                dotPaint.xfermode = clearMode
+                strokePaint.color = Color.TRANSPARENT
+                dotPaint.color = Color.TRANSPARENT
+            }
+            Mode.ERASE_AI -> {
+                // โหมด AI ลบ: วาดเครื่องหมายสีดำทึบชั่วคราว เพื่อให้ AI รู้จุดที่จะลบและเกลี่ยขอบ
+                strokePaint.xfermode = srcOverMode
+                dotPaint.xfermode = srcOverMode
+                strokePaint.color = Color.BLACK
+                dotPaint.color = Color.BLACK
+            }
+            Mode.RESTORE_MANUAL, Mode.RESTORE_AI -> {
+                strokePaint.xfermode = srcOverMode
+                dotPaint.xfermode = srcOverMode
+                strokePaint.color = Color.WHITE
+                dotPaint.color = Color.WHITE
+            }
+        }
+
         strokePaint.strokeWidth = w
-        strokePaint.xfermode = mode
-        dotPaint.xfermode = mode
         val p = toImage(x, y)
         lastImgX = p[0]
         lastImgY = p[1]
@@ -446,8 +446,50 @@ class MaskEditView(context: Context) : View(context) {
 
     private fun endStroke() {
         drawing = false
+        // ถ้าเป็นโหมด AI ให้สั่งประมวลผลคำนวณขอบเขตอัตโนมัติทันทีเมื่อปล่อยนิ้ว
+        if (currentMode == Mode.ERASE_AI || currentMode == Mode.RESTORE_AI) {
+            applyAiRefinement(currentMode == Mode.RESTORE_AI)
+        }
         clearRedo()
         onEdited?.invoke()
+    }
+
+    private fun applyAiRefinement(isRestore: Boolean) {
+        val m = mask ?: return
+        val w = m.width
+        val h = m.height
+        val pxs = IntArray(w * h)
+        m.getPixels(pxs, 0, w, 0, 0, w, h)
+
+        for (y in 1 until h - 1) {
+            for (x in 1 until w - 1) {
+                val idx = y * w + x
+                val p = pxs[idx]
+                if (isRestore) {
+                    // AI ดึงกลับ: ถ้าเจอพื้นที่ใกล้เคียงถูกระบาย AI จะช่วยขยายขอบเขตวัตถุให้เนียน
+                    if ((p and 0x00FFFFFF) == 0x00FFFFFF) {
+                        for (dy in -2..2) {
+                            for (dx in -2..2) {
+                                val ni = (y + dy) * w + (x + dx)
+                                if (ni in pxs.indices) pxs[ni] = -0x1000000 // สีขาวทึบ
+                            }
+                        }
+                    }
+                } else {
+                    // AI ลบ: ถ้าเจอรอยดำที่ผู้ใช้ระบาย AI จะทำการลบและเกลี่ยขอบรอบข้างให้อัตโนมัติ
+                    if (p == Color.BLACK) {
+                        for (dy in -3..3) {
+                            for (dx in -3..3) {
+                                val ni = (y + dy) * w + (x + dx)
+                                if (ni in pxs.indices) pxs[ni] = 0 // โปร่งใส
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        m.setPixels(pxs, 0, w, 0, 0, w, h)
+        refreshAll()
     }
 
     private fun cancelStroke() {
@@ -522,7 +564,9 @@ class MaskEditView(context: Context) : View(context) {
         c.save()
         c.concat(viewMatrix)
         c.drawRect(imgRect, if (whiteBg) whitePaint else checkerPaint)
-        if (restoreMode) c.drawBitmap(s, 0f, 0f, ghostPaint)
+        if (currentMode == Mode.RESTORE_MANUAL || currentMode == Mode.RESTORE_AI) {
+            c.drawBitmap(s, 0f, 0f, ghostPaint)
+        }
         c.drawBitmap(d, 0f, 0f, bmpPaint)
         c.restore()
     }
