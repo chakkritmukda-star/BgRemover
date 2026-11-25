@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.SystemClock
@@ -54,7 +55,6 @@ class MainActivity : AppCompatActivity() {
                 val item = photoList[editingIndex]
                 item.result = edited
                 item.hasBgRemoved = BitmapStore.hasBgRemoved
-                // หากยังไม่เคยลบพื้นหลัง แต่เข้าไปใช้ Magic Eraser ลบวัตถุ ให้อัปเดตต้นฉบับด้วยเพื่อให้กดลบพื้นหลังต่อได้ทันที
                 if (!BitmapStore.hasBgRemoved) {
                     BitmapStore.editingOriginal?.let { updatedOrig ->
                         photoList[editingIndex] = item.copy(original = updatedOrig, result = edited)
@@ -96,7 +96,6 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // โหลดโมเดล AI ล่วงหน้าทันทีที่เปิดแอป จะได้ไม่ต้องรอตอนกดใช้งานจริง
         lifecycleScope.launch {
             AiEngine.warmUp(this@MainActivity, selectedQuality)
         }
@@ -116,7 +115,6 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 0, 0, 12)
         }
 
-        // แถบสลับโหมดความเร็วการลบพื้นหลัง
         val modeRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -419,13 +417,15 @@ class MainActivity : AppCompatActivity() {
             }
 
             holder.card.setOnClickListener {
-                val pos = holder.bindingAdapterPosition
+                @Suppress("DEPRECATION")
+                val pos = holder.adapterPosition
                 if (pos != RecyclerView.NO_POSITION) {
                     openEditorForIndex(pos, startInMagicEraser = !item.hasBgRemoved)
                 }
             }
             holder.magicChip.setOnClickListener {
-                val pos = holder.bindingAdapterPosition
+                @Suppress("DEPRECATION")
+                val pos = holder.adapterPosition
                 if (pos != RecyclerView.NO_POSITION) {
                     openEditorForIndex(pos, startInMagicEraser = true)
                 }
@@ -453,7 +453,7 @@ class MainActivity : AppCompatActivity() {
                 canvas.drawRect(x.toFloat(), y.toFloat(), (x + step).toFloat(), (y + step).toFloat(), paint)
             }
         }
-        val destRect = android.graphics.RectF(0f, 0f, w.toFloat(), h.toFloat())
+        val destRect = RectF(0f, 0f, w.toFloat(), h.toFloat())
         canvas.drawBitmap(src, null, destRect, Paint(Paint.FILTER_BITMAP_FLAG))
         return out
     }
