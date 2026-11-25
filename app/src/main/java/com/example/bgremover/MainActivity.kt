@@ -145,7 +145,7 @@ class MainActivity : AppCompatActivity() {
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
     private fun showReadyText() {
-        tvStatus.text = "มี ${Store.items.size} รูป • แตะรูปเพื่อแก้ด้วยพู่กัน • กดค้างเพื่อเอาออก"
+        tvStatus.text = "มี ${Store.items.size} รูป • แตะรูปเพื่อแก้ด้วยพู่กัน AI • กดค้างเพื่อเอาออก"
     }
 
     private fun bg(): Drawable =
@@ -236,7 +236,7 @@ class MainActivity : AppCompatActivity() {
         Store.items.clear()
         rebuildPreviews()
 
-        tvStatus.text = "กำลังเตรียม AI (ครั้งแรกอาจใช้เวลา 10-30 วินาที)..."
+        tvStatus.text = "กำลังโหลด BiRefNet AI (ครั้งแรกอาจใช้เวลา 10-30 วินาที)..."
         val s = try {
             getSession()
         } catch (e: Throwable) {
@@ -247,7 +247,7 @@ class MainActivity : AppCompatActivity() {
 
         val dir = File(cacheDir, "work").apply { mkdirs() }
         for ((i, uri) in uris.withIndex()) {
-            tvStatus.text = "กำลังลบพื้นหลัง ${i + 1}/${uris.size} ..."
+            tvStatus.text = "กำลังลบพื้นหลังด้วย AI ขั้นสูง ${i + 1}/${uris.size} ..."
             try {
                 val item = withContext(Dispatchers.Default) {
                     val src = loadBitmap(uri)
@@ -303,9 +303,9 @@ class MainActivity : AppCompatActivity() {
         val arr = buf.array()
         for (k in 0 until area) {
             val c = px[k]
-            arr[k] = ((c shr 16) and 0xFF) / 255f - 0.5f
-            arr[area + k] = ((c shr 8) and 0xFF) / 255f - 0.5f
-            arr[2 * area + k] = (c and 0xFF) / 255f - 0.5f
+            arr[k] = ((c shr 16) and 0xFF) / 255f
+            arr[area + k] = ((c shr 8) and 0xFF) / 255f
+            arr[2 * area + k] = (c and 0xFF) / 255f
         }
 
         val inputName = s.inputNames.iterator().next()
@@ -318,17 +318,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        var mn = Float.MAX_VALUE
-        var mx = -Float.MAX_VALUE
-        for (v in out) {
-            if (v < mn) mn = v
-            if (v > mx) mx = v
-        }
-        val range = (mx - mn).coerceAtLeast(1e-6f)
         val maskPx = IntArray(area)
         for (k in 0 until area) {
-            var a = (out[k] - mn) / range
-            a = ((a - 0.08f) / 0.84f).coerceIn(0f, 1f)   // ทำให้ขอบคมขึ้น ลดเงาจาง ๆ
+            val a = out[k].coerceIn(0f, 1f)
             maskPx[k] = (a * 255f).toInt() shl 24
         }
         val small = Bitmap.createBitmap(maskPx, SIZE, SIZE, Bitmap.Config.ARGB_8888)
