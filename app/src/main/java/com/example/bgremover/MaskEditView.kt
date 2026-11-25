@@ -1,439 +1,566 @@
 package com.example.bgremover
 
-import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.*
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
-import java.util.*
+import java.util.ArrayDeque
+import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.min
 
-@SuppressLint("ViewConstructor", "ClickableViewAccessibility")
 class MaskEditView(context: Context) : View(context) {
 
-    enum class Mode { ERASE_MANUAL, ERASE_MAGIC, RESTORE_MANUAL, RESTORE_MAGIC }
-
-    var src: Bitmap? = null
-        private set
-    var mask: Bitmap? = null
-        private set
-    private var maskCanvas: Canvas? = null
-    private var cutout: Bitmap? = null
-    private var cutoutCanvas: Canvas? = null
-
-    var currentMode = Mode.ERASE_MANUAL
-        set(v) { field = v; invalidate() }
-    var whiteBg = false
-        set(v) { field = v; invalidate() }
-    var brushPx = 60f
-    var onEdited: (() -> Unit)? = null
-
-    private val undoStack = ArrayDeque<Bitmap>()
-    private val redoStack = ArrayDeque<Bitmap>()
-    private val MAX_UNDO = 8
-
-    private val viewMatrix = Matrix()
-    private val inverse = Matrix()
-    private val mv = FloatArray(9)
-    private var minScale = 0.1f
-    private var maxScale = 20f
-    private val imgRect = RectF()
-
-    private val dstIn = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN) }
-    private val bmpPaint = Paint(Paint.FILTER_BITMAP_FLAG)
-    private val ghostPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply { alpha = 120 }
-    private val whitePaint = Paint().apply { color = Color.WHITE }
-    private val checkerPaint = Paint().apply {
-        shader = BitmapShader(Img.checkerTile(), Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
+    enum class Mode {
+        MAGIC_ERASER,    // ✨ ลบวัตถุแล้วเติมพื้นหลังเนียนแบบ Photoroom (MI-GAN AI Inpainting)
+        ERASE_MANUAL,    // 🧹 ระบายเจาะพื้นหลังให้ใส
+        RESTORE_MANUAL,  // 🖌️ กู้คืนพื้นหลังกลับมา
+        SMART_CUTOUT,    // 🪄 ลบสีพื้นหลังใกล้เคียงอัตโนมัติ (ไม่ไหลทะลุตัวคน)
+        PAN              // 🖐 เลื่อนและซูม 2 นิ้ว
     }
 
-    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private data class HistorySnapshot(
+        val colorBmp: Bitmap,
+        val alphaBmp: Bitmap
+    )
+
+    var mode: Mode = Mode.MAGIC_ERASER
+        set(value) {
+            field = value
+            clearStrokeOverlay()
+            invalidate()
+        }
+
+    var brushRadiusScreen: Float = 44f
+        set(value) {
+            field = value
+            showBrushPreviewUntil = System.currentTimeMillis() + 900L
+            invalidate()
+        }
+
+    var onHistoryChanged: ((canUndo: Boolean, canRedo: Boolean) -> Unit)? = null
+    var onMagicEraseStrokeFinished: ((strokeMask: Bitmap) -> Unit)? = null
+
+    private var initialOriginalBmp: Bitmap? = null
+    private var workingColorBmp: Bitmap? = null
+    private var alphaMaskBmp: Bitmap? = null
+    private var strokeOverlayBmp: Bitmap? = null
+
+    private var alphaCanvas: Canvas? = null
+    private var strokeCanvas: Canvas? = null
+
+    private var isInitialFitDone = false
+    private var isComparingOriginal = false
+    private var isBusy = false
+    private var showBrushPreviewUntil = 0L
+
+    private val viewMatrix = Matrix()
+    private val invMatrix = Matrix()
+
+    private val drawPath = Path()
+    private var isDrawingStroke = false
+    private var lastTouchX = 0f
+    private var lastTouchY = 0f
+    private var lastImgX = 0f
+    private var lastImgY = 0f
+
+    private val undoStack = ArrayDeque<HistorySnapshot>()
+    private val redoStack = ArrayDeque<HistorySnapshot>()
+    private val maxHistory = 10
+
+    private val paintEraseAlpha = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
+        xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
     }
-    private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+
+    private val paintRestoreAlpha = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        color = Color.BLACK
+    }
+
+    private val paintStrokeMask = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        color = Color.WHITE
+    }
+
+    private val paintMaskDstIn = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+        xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
+    }
+
+    private val paintMagicTint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+        colorFilter = PorterDuffColorFilter(Color.parseColor("#B3A855F7"), PorterDuff.Mode.SRC_IN)
+    }
+
+    private val paintSmartTint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+        colorFilter = PorterDuffColorFilter(Color.parseColor("#99EF4444"), PorterDuff.Mode.SRC_IN)
+    }
+
+    private val paintBrushRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = Color.WHITE
+    }
+
+    private val paintBrushFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-    }
-    private val clearMode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
-    private val srcOverMode = PorterDuffXfermode(PorterDuff.Mode.SRC_OVER)
-
-    private val ringWhite = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE; strokeWidth = 5f; color = Color.WHITE
-    }
-    private val ringBlack = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE; strokeWidth = 2f; color = Color.BLACK
-    }
-    private val loupeBorder = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE; strokeWidth = 6f; color = Color.WHITE
-    }
-    private val loupePath = Path()
-    private val viewBg = Color.rgb(40, 40, 40)
-
-    private var drawing = false
-    private var gesture = false
-    private var needReset = false
-    private var touchX = 0f
-    private var touchY = 0f
-    private var lastImgX = 0f
-    private var lastImgY = 0f
-    private var lastMidX = 0f
-    private var lastMidY = 0f
-    private var lastDist = 0f
-    private var previewCenter = false
-    private val hidePreview = Runnable { previewCenter = false; invalidate() }
-
-    fun setImages(s: Bitmap, m: Bitmap) {
-        src = s
-        setMaskInternal(m)
-        cutout = Bitmap.createBitmap(s.width, s.height, Bitmap.Config.ARGB_8888)
-        cutoutCanvas = Canvas(cutout!!)
-        imgRect.set(0f, 0f, s.width.toFloat(), s.height.toFloat())
-        refreshAll()
-        fitToView()
+        color = Color.parseColor("#55A855F7")
     }
 
-    private fun setMaskInternal(b: Bitmap) {
-        mask = b
-        maskCanvas = Canvas(b)
+    private val paintCheckerA = Paint().apply { color = Color.parseColor("#CBD5E1") }
+    private val paintCheckerB = Paint().apply { color = Color.parseColor("#F8FAFC") }
+    private val bmpPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+
+    private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScale(detector: ScaleGestureDetector): Boolean {
+            val factor = detector.scaleFactor.coerceIn(0.5f, 2.0f)
+            viewMatrix.postScale(factor, factor, detector.focusX, detector.focusY)
+            invalidate()
+            return true
+        }
+    })
+
+    init {
+        setLayerType(LAYER_TYPE_SOFTWARE, null)
     }
 
-    fun fitToView() {
-        val s = src ?: return
-        if (width == 0 || height == 0) return
-        val sc = minOf(width.toFloat() / s.width, height.toFloat() / s.height) * 0.94f
-        viewMatrix.reset()
-        viewMatrix.postScale(sc, sc)
-        viewMatrix.postTranslate((width - s.width * sc) / 2f, (height - s.height * sc) / 2f)
-        viewMatrix.invert(inverse)
-        minScale = sc * 0.5f
-        maxScale = sc * 15f
+    fun setImages(original: Bitmap, currentResult: Bitmap, hasBgRemoved: Boolean) {
+        val w = original.width
+        val h = original.height
+        initialOriginalBmp = original.copy(Bitmap.Config.ARGB_8888, false)
+
+        // เตรียมภาพสีและเลเยอร์ความโปร่งใสแยกจากกันอย่างสะอาด
+        if (hasBgRemoved) {
+            workingColorBmp = original.copy(Bitmap.Config.ARGB_8888, true)
+            // คัดลอกค่าสีที่อาจเคยถูก Magic Eraser แก้ไว้ใน currentResult (เฉพาะพิกเซลที่ไม่ใสสนิท)
+            val origPx = IntArray(w * h)
+            val curPx = IntArray(w * h)
+            val alphaPx = IntArray(w * h)
+            workingColorBmp!!.getPixels(origPx, 0, w, 0, 0, w, h)
+            currentResult.getPixels(curPx, 0, w, 0, 0, w, h)
+            for (i in curPx.indices) {
+                val a = (curPx[i] ushr 24) and 0xFF
+                alphaPx[i] = a shl 24
+                if (a > 16) {
+                    origPx[i] = (0xFF shl 24) or (curPx[i] and 0x00FFFFFF)
+                }
+            }
+            workingColorBmp!!.setPixels(origPx, 0, w, 0, 0, w, h)
+            alphaMaskBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+                setPixels(alphaPx, 0, w, 0, 0, w, h)
+            }
+        } else {
+            workingColorBmp = currentResult.copy(Bitmap.Config.ARGB_8888, true)
+            alphaMaskBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
+                eraseColor(Color.BLACK) // ทึบ 100% ทั้งภาพ
+            }
+        }
+
+        alphaCanvas = Canvas(alphaMaskBmp!!)
+        strokeOverlayBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        strokeCanvas = Canvas(strokeOverlayBmp!!)
+
+        undoStack.clear()
+        redoStack.clear()
+        pushUndoState()
+        isInitialFitDone = false
+        requestLayout()
         invalidate()
+    }
+
+    fun setProcessingBusy(busy: Boolean) {
+        isBusy = busy
+        if (!busy) clearStrokeOverlay()
+        invalidate()
+    }
+
+    fun setCompareOriginal(compare: Boolean) {
+        isComparingOriginal = compare
+        invalidate()
+    }
+
+    fun applyInpaintedBitmap(newColorBmp: Bitmap) {
+        workingColorBmp = newColorBmp
+        clearStrokeOverlay()
+        pushUndoState()
+        invalidate()
+    }
+
+    private fun clearStrokeOverlay() {
+        strokeOverlayBmp?.eraseColor(Color.TRANSPARENT)
+    }
+
+    private fun pushUndoState() {
+        val c = workingColorBmp ?: return
+        val a = alphaMaskBmp ?: return
+        if (undoStack.size >= maxHistory) {
+            val dropped = undoStack.removeFirst()
+            dropped.colorBmp.recycle()
+            dropped.alphaBmp.recycle()
+        }
+        undoStack.addLast(
+            HistorySnapshot(
+                colorBmp = c.copy(Bitmap.Config.ARGB_8888, true),
+                alphaBmp = a.copy(Bitmap.Config.ARGB_8888, true)
+            )
+        )
+        while (redoStack.isNotEmpty()) {
+            val r = redoStack.removeLast()
+            r.colorBmp.recycle()
+            r.alphaBmp.recycle()
+        }
+        notifyHistory()
+    }
+
+    fun undo() {
+        if (isBusy || undoStack.size <= 1) return
+        val current = undoStack.removeLast()
+        redoStack.addLast(current)
+        restoreSnapshot(undoStack.last())
+        notifyHistory()
+    }
+
+    fun redo() {
+        if (isBusy || redoStack.isEmpty()) return
+        val next = redoStack.removeLast()
+        undoStack.addLast(next)
+        restoreSnapshot(next)
+        notifyHistory()
+    }
+
+    private fun restoreSnapshot(snap: HistorySnapshot) {
+        workingColorBmp = snap.colorBmp.copy(Bitmap.Config.ARGB_8888, true)
+        alphaMaskBmp = snap.alphaBmp.copy(Bitmap.Config.ARGB_8888, true)
+        alphaCanvas = Canvas(alphaMaskBmp!!)
+        clearStrokeOverlay()
+        invalidate()
+    }
+
+    private fun notifyHistory() {
+        onHistoryChanged?.invoke(undoStack.size > 1, redoStack.isNotEmpty())
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        fitToView()
+        val bmp = workingColorBmp ?: return
+        if (!isInitialFitDone && w > 0 && h > 0) {
+            val scale = min(w.toFloat() / bmp.width, h.toFloat() / bmp.height) * 0.94f
+            val dx = (w - bmp.width * scale) / 2f
+            val dy = (h - bmp.height * scale) / 2f
+            viewMatrix.reset()
+            viewMatrix.postScale(scale, scale)
+            viewMatrix.postTranslate(dx, dy)
+            isInitialFitDone = true
+        }
     }
 
-    fun showBrushPreview() {
-        previewCenter = true
-        removeCallbacks(hidePreview)
-        postDelayed(hidePreview, 800)
-        invalidate()
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val colorBmp = workingColorBmp ?: return
+        val maskBmp = alphaMaskBmp ?: return
+
+        drawCheckerboard(canvas)
+
+        if (isComparingOriginal && initialOriginalBmp != null) {
+            canvas.save()
+            canvas.concat(viewMatrix)
+            canvas.drawBitmap(initialOriginalBmp!!, 0f, 0f, bmpPaint)
+            canvas.restore()
+            return
+        }
+
+        val saveLayer = canvas.saveLayer(0f, 0f, width.toFloat(), height.toFloat(), null)
+        canvas.concat(viewMatrix)
+        canvas.drawBitmap(colorBmp, 0f, 0f, bmpPaint)
+        canvas.drawBitmap(maskBmp, 0f, 0f, paintMaskDstIn)
+        strokeOverlayBmp?.let { overlay ->
+            val tint = if (mode == Mode.MAGIC_ERASER) paintMagicTint else paintSmartTint
+            canvas.drawBitmap(overlay, 0f, 0f, tint)
+        }
+        canvas.restoreToCount(saveLayer)
+
+        // วาดวงกลมแสดงตำแหน่งแปรงขณะลากนิ้ว + แว่นขยายมุมบนซ้าย
+        if (isDrawingStroke && mode != Mode.PAN) {
+            canvas.drawCircle(lastTouchX, lastTouchY, brushRadiusScreen, paintBrushFill)
+            canvas.drawCircle(lastTouchX, lastTouchY, brushRadiusScreen, paintBrushRing)
+            drawMagnifierLoupe(canvas)
+        } else if (System.currentTimeMillis() < showBrushPreviewUntil) {
+            val cx = width / 2f
+            val cy = height / 2f
+            canvas.drawCircle(cx, cy, brushRadiusScreen, paintBrushFill)
+            canvas.drawCircle(cx, cy, brushRadiusScreen, paintBrushRing)
+        }
     }
 
-    fun undo() {
-        if (drawing || undoStack.isEmpty() || mask == null) return
-        redoStack.addLast(mask!!)
-        setMaskInternal(undoStack.removeLast())
-        refreshAll()
-        onEdited?.invoke()
+    private fun drawMagnifierLoupe(canvas: Canvas) {
+        val colorBmp = workingColorBmp ?: return
+        val maskBmp = alphaMaskBmp ?: return
+        val loupeSize = 230f
+        val margin = 24f
+        val placeRight = lastTouchX < loupeSize + 80f && lastTouchY < loupeSize + 80f
+        val left = if (placeRight) width - loupeSize - margin else margin
+        val top = margin
+        val cx = left + loupeSize / 2f
+        val cy = top + loupeSize / 2f
+        val radius = loupeSize / 2f
+
+        val clipSave = canvas.save()
+        val circlePath = Path().apply { addCircle(cx, cy, radius, Path.Direction.CW) }
+        canvas.clipPath(circlePath)
+        canvas.drawColor(Color.parseColor("#1E293B"))
+
+        val zoom = currentScale() * 1.8f
+        val loupeMatrix = Matrix().apply {
+            postTranslate(-lastImgX, -lastImgY)
+            postScale(zoom, zoom)
+            postTranslate(cx, cy)
+        }
+
+        val layer = canvas.saveLayer(left, top, left + loupeSize, top + loupeSize, null)
+        canvas.concat(loupeMatrix)
+        canvas.drawBitmap(colorBmp, 0f, 0f, bmpPaint)
+        canvas.drawBitmap(maskBmp, 0f, 0f, paintMaskDstIn)
+        strokeOverlayBmp?.let {
+            val tint = if (mode == Mode.MAGIC_ERASER) paintMagicTint else paintSmartTint
+            canvas.drawBitmap(it, 0f, 0f, tint)
+        }
+        canvas.restoreToCount(layer)
+
+        val imgBrushR = (brushRadiusScreen / currentScale()) * zoom
+        canvas.drawCircle(cx, cy, imgBrushR, paintBrushRing)
+        canvas.restoreToCount(clipSave)
+
+        canvas.drawCircle(cx, cy, radius, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 5f
+            color = Color.parseColor("#A855F7")
+        })
     }
 
-    fun redo() {
-        if (drawing || redoStack.isEmpty() || mask == null) return
-        undoStack.addLast(mask!!)
-        setMaskInternal(redoStack.removeLast())
-        refreshAll()
-        onEdited?.invoke()
-    }
-
-    fun resetTo(ai: Bitmap) {
-        val m = mask ?: return
-        undoStack.addLast(m)
-        trimUndo()
-        clearRedo()
-        setMaskInternal(ai)
-        refreshAll()
-        onEdited?.invoke()
-    }
-
-    private fun trimUndo() {
-        while (undoStack.size > MAX_UNDO) undoStack.removeFirst().recycle()
-    }
-
-    private fun clearRedo() {
-        redoStack.forEach { it.recycle() }
-        redoStack.clear()
-    }
-
-    private fun curScale(): Float {
-        viewMatrix.getValues(mv)
-        return mv[Matrix.MSCALE_X]
-    }
-
-    private fun toImage(x: Float, y: Float): FloatArray {
-        val p = floatArrayOf(x, y)
-        inverse.mapPoints(p)
-        return p
-    }
-
-    private fun refreshAll() {
-        val s = src ?: return
-        refreshRect(0, 0, s.width, s.height)
-        invalidate()
-    }
-
-    private fun refresh(x1: Float, y1: Float, x2: Float, y2: Float, r: Float) {
-        val s = src ?: return
-        val l = (minOf(x1, x2) - r - 2).toInt().coerceAtLeast(0)
-        val t = (minOf(y1, y2) - r - 2).toInt().coerceAtLeast(0)
-        val rr = (maxOf(x1, x2) + r + 2).toInt().coerceAtMost(s.width)
-        val b = (maxOf(y1, y2) + r + 2).toInt().coerceAtMost(s.height)
-        if (l < rr && t < b) refreshRect(l, t, rr, b)
-    }
-
-    private fun refreshRect(l: Int, t: Int, r: Int, b: Int) {
-        val s = src ?: return
-        val m = mask ?: return
-        val c = cutoutCanvas ?: return
-        c.save()
-        c.clipRect(l, t, r, b)
-        c.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-        c.drawBitmap(s, 0f, 0f, null)
-        c.drawBitmap(m, 0f, 0f, dstIn)
-        c.restore()
-    }
-
-    private fun beginStroke(x: Float, y: Float) {
-        val m = mask ?: return
-        undoStack.addLast(m.copy(Bitmap.Config.ARGB_8888, true))
-        trimUndo()
-        drawing = true
-        val w = brushPx / curScale()
-
-        when (currentMode) {
-            Mode.ERASE_MANUAL -> {
-                strokePaint.xfermode = clearMode
-                dotPaint.xfermode = clearMode
-            }
-            Mode.ERASE_MAGIC, Mode.RESTORE_MAGIC -> {
-                strokePaint.xfermode = srcOverMode
-                dotPaint.xfermode = srcOverMode
-                strokePaint.color = Color.RED
-                dotPaint.color = Color.RED
-            }
-            Mode.RESTORE_MANUAL -> {
-                strokePaint.xfermode = srcOverMode
-                dotPaint.xfermode = srcOverMode
-                strokePaint.color = Color.WHITE
-                dotPaint.color = Color.WHITE
+    private fun drawCheckerboard(canvas: Canvas) {
+        val step = 32
+        for (y in 0 until height step step) {
+            for (x in 0 until width step step) {
+                val p = if (((x / step) + (y / step)) % 2 == 0) paintCheckerA else paintCheckerB
+                canvas.drawRect(x.toFloat(), y.toFloat(), (x + step).toFloat(), (y + step).toFloat(), p)
             }
         }
-
-        strokePaint.strokeWidth = w
-        val p = toImage(x, y)
-        lastImgX = p[0]
-        lastImgY = p[1]
-        maskCanvas?.drawCircle(lastImgX, lastImgY, w / 2f, dotPaint)
-        if (currentMode == Mode.ERASE_MANUAL || currentMode == Mode.RESTORE_MANUAL) {
-            refresh(lastImgX, lastImgY, lastImgX, lastImgY, w / 2f)
-        }
-        invalidate()
     }
 
-    private fun continueStroke(x: Float, y: Float) {
-        val p = toImage(x, y)
-        maskCanvas?.drawLine(lastImgX, lastImgY, p[0], p[1], strokePaint)
-        if (currentMode == Mode.ERASE_MANUAL || currentMode == Mode.RESTORE_MANUAL) {
-            refresh(lastImgX, lastImgY, p[0], p[1], strokePaint.strokeWidth / 2f)
-        }
-        lastImgX = p[0]
-        lastImgY = p[1]
-        invalidate()
+    private fun currentScale(): Float {
+        val vals = FloatArray(9)
+        viewMatrix.getValues(vals)
+        return hypot(vals[Matrix.MSCALE_X], vals[Matrix.MSKEW_X]).coerceAtLeast(0.05f)
     }
 
-    private fun endStroke() {
-        drawing = false
-        if (currentMode == Mode.ERASE_MAGIC || currentMode == Mode.RESTORE_MAGIC) {
-            applyMagicEraser(currentMode == Mode.RESTORE_MAGIC)
-        }
-        clearRedo()
-        refreshAll()
-        onEdited?.invoke()
-    }
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (isBusy) return true
+        scaleDetector.onTouchEvent(event)
 
-    private fun applyMagicEraser(isRestore: Boolean) {
-        val m = mask ?: return
-        val s = src ?: return
-        val w = m.width
-        val h = m.height
-        val maskPx = IntArray(w * h)
-        val srcPx = IntArray(w * h)
-        m.getPixels(maskPx, 0, w, 0, 0, w, h)
-        s.getPixels(srcPx, 0, w, 0, 0, w, h)
-
-        val visited = BooleanArray(w * h)
-        val queue = ArrayDeque<Int>()
-
-        for (i in maskPx.indices) {
-            if (maskPx[i] == Color.RED) {
-                queue.add(i)
-                visited[i] = true
+        if (event.pointerCount > 1 || mode == Mode.PAN) {
+            if (isDrawingStroke) {
+                isDrawingStroke = false
+                clearStrokeOverlay()
             }
-        }
-
-        val filled = BooleanArray(w * h)
-        while (queue.isNotEmpty()) {
-            val idx = queue.poll() ?: break
-            filled[idx] = true
-
-            val cx = idx % w
-            val cy = idx / w
-            val baseColor = srcPx[idx]
-            val br = (baseColor shr 16) and 0xFF
-            val bg = (baseColor shr 8) and 0xFF
-            val bb = baseColor and 0xFF
-
-            for (dy in -2..2) {
-                for (dx in -2..2) {
-                    if (dx == 0 && dy == 0) continue
-                    val nx = cx + dx
-                    val ny = cy + dy
-                    if (nx in 0 until w && ny in 0 until h) {
-                        val nIdx = ny * w + nx
-                        if (!visited[nIdx]) {
-                            visited[nIdx] = true
-                            val nc = srcPx[nIdx]
-                            val nr = (nc shr 16) and 0xFF
-                            val ng = (nc shr 8) and 0xFF
-                            val nb = nc and 0xFF
-                            val diff = kotlin.math.abs(br - nr) + kotlin.math.abs(bg - ng) + kotlin.math.abs(bb - nb)
-                            if (diff < 75) {
-                                queue.add(nIdx)
-                            }
-                        }
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                    lastTouchX = event.x
+                    lastTouchY = event.y
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (!scaleDetector.isInProgress) {
+                        viewMatrix.postTranslate(event.x - lastTouchX, event.y - lastTouchY)
+                        invalidate()
                     }
+                    lastTouchX = event.x
+                    lastTouchY = event.y
                 }
             }
+            return true
         }
 
-        for (i in maskPx.indices) {
-            if (filled[i]) {
-                maskPx[i] = if (isRestore) -0x1000000 else 0
-            } else if (maskPx[i] == Color.RED) {
-                maskPx[i] = if (isRestore) -0x1000000 else 0
-            }
-        }
-        m.setPixels(maskPx, 0, w, 0, 0, w, h)
-    }
+        viewMatrix.invert(invMatrix)
+        val pt = floatArrayOf(event.x, event.y)
+        invMatrix.mapPoints(pt)
+        val imgX = pt[0]
+        val imgY = pt
+        val strokeWidthImg = (brushRadiusScreen * 2f) / currentScale()
 
-    private fun cancelStroke() {
-        drawing = false
-        if (undoStack.isNotEmpty()) {
-            val old = mask
-            setMaskInternal(undoStack.removeLast())
-            old?.recycle()
-            refreshAll()
-        }
-    }
+        paintEraseAlpha.strokeWidth = strokeWidthImg
+        paintRestoreAlpha.strokeWidth = strokeWidthImg
+        paintStrokeMask.strokeWidth = strokeWidthImg
 
-    override fun onTouchEvent(e: MotionEvent): Boolean {
-        if (src == null) return true
-        when (e.actionMasked) {
+        when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                gesture = false
-                touchX = e.x
-                touchY = e.y
-                beginStroke(e.x, e.y)
+                isDrawingStroke = true
+                lastTouchX = event.x
+                lastTouchY = event.y
+                lastImgX = imgX
+                lastImgY = imgY
+                drawPath.reset()
+                drawPath.moveTo(imgX, imgY)
+                drawPointOrPath(imgX, imgY, isSingleTap = true)
+                invalidate()
             }
-            MotionEvent.ACTION_POINTER_DOWN -> {
-                if (drawing) cancelStroke()
-                gesture = true
-                needReset = true
-            }
-            MotionEvent.ACTION_POINTER_UP -> needReset = true
             MotionEvent.ACTION_MOVE -> {
-                if (gesture) {
-                    if (e.pointerCount >= 2) {
-                        val mx = (e.getX(0) + e.getX(1)) / 2f
-                        val my = (e.getY(0) + e.getY(1)) / 2f
-                        val d = hypot(e.getX(0) - e.getX(1), e.getY(0) - e.getY(1))
-                        if (!needReset) {
-                            viewMatrix.postTranslate(mx - lastMidX, my - lastMidY)
-                            if (lastDist > 10f && d > 10f) {
-                                val cur = curScale()
-                                val f = (cur * d / lastDist).coerceIn(minScale, maxScale) / cur
-                                viewMatrix.postScale(f, f, mx, my)
-                            }
-                            viewMatrix.invert(inverse)
-                            invalidate()
-                        }
-                        needReset = false
-                        lastMidX = mx
-                        lastMidY = my
-                        lastDist = d
-                    }
-                } else if (drawing) {
-                    touchX = e.x
-                    touchY = e.y
-                    continueStroke(e.x, e.y)
+                if (isDrawingStroke) {
+                    lastTouchX = event.x
+                    lastTouchY = event.y
+                    lastImgX = imgX
+                    lastImgY = imgY
+                    drawPath.lineTo(imgX, imgY)
+                    drawPointOrPath(imgX, imgY, isSingleTap = false)
+                    invalidate()
                 }
             }
-            MotionEvent.ACTION_UP -> {
-                if (drawing) endStroke()
-                gesture = false
-                invalidate()
-            }
-            MotionEvent.ACTION_CANCEL -> {
-                if (drawing) cancelStroke()
-                gesture = false
-                invalidate()
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (isDrawingStroke) {
+                    isDrawingStroke = false
+                    when (mode) {
+                        Mode.MAGIC_ERASER -> {
+                            val strokeCopy = strokeOverlayBmp?.copy(Bitmap.Config.ARGB_8888, false)
+                            if (strokeCopy != null) {
+                                onMagicEraseStrokeFinished?.invoke(strokeCopy)
+                            }
+                        }
+                        Mode.SMART_CUTOUT -> {
+                            applySeedColorCutout()
+                            clearStrokeOverlay()
+                            pushUndoState()
+                        }
+                        Mode.ERASE_MANUAL, Mode.RESTORE_MANUAL -> {
+                            pushUndoState()
+                        }
+                        Mode.PAN -> {}
+                    }
+                    invalidate()
+                }
             }
         }
         return true
     }
 
-    private fun drawContent(c: Canvas) {
-        val s = src ?: return
-        val d = cutout ?: return
-        c.save()
-        c.concat(viewMatrix)
-        c.drawRect(imgRect, if (whiteBg) whitePaint else checkerPaint)
-        if (currentMode == Mode.RESTORE_MANUAL || currentMode == Mode.RESTORE_MAGIC) {
-            c.drawBitmap(s, 0f, 0f, ghostPaint)
+    private fun drawPointOrPath(imgX: Float, imgY: Float, isSingleTap: Boolean) {
+        when (mode) {
+            Mode.MAGIC_ERASER, Mode.SMART_CUTOUT -> {
+                val sc = strokeCanvas ?: return
+                if (isSingleTap) {
+                    sc.drawPoint(imgX, imgY, paintStrokeMask)
+                } else {
+                    sc.drawPath(drawPath, paintStrokeMask)
+                }
+            }
+            Mode.ERASE_MANUAL -> {
+                val ac = alphaCanvas ?: return
+                if (isSingleTap) ac.drawPoint(imgX, imgY, paintEraseAlpha)
+                else ac.drawPath(drawPath, paintEraseAlpha)
+            }
+            Mode.RESTORE_MANUAL -> {
+                val ac = alphaCanvas ?: return
+                if (isSingleTap) ac.drawPoint(imgX, imgY, paintRestoreAlpha)
+                else ac.drawPath(drawPath, paintRestoreAlpha)
+            }
+            Mode.PAN -> {}
         }
-        c.drawBitmap(d, 0f, 0f, bmpPaint)
-        c.restore()
     }
 
-    private fun drawRing(c: Canvas, x: Float, y: Float, r: Float) {
-        c.drawCircle(x, y, r, ringWhite)
-        c.drawCircle(x, y, r, ringBlack)
-    }
+    /**
+     * ลบเฉพาะโทนสีที่ใกล้เคียงกับจุดที่ระบาย (Seed Color Flood-Fill) ป้องกันสีไหลทะลุตัวคน
+     */
+    private fun applySeedColorCutout() {
+        val colorBmp = workingColorBmp ?: return
+        val maskBmp = alphaMaskBmp ?: return
+        val strokeBmp = strokeOverlayBmp ?: return
 
-    private fun drawLoupe(c: Canvas) {
-        val size = minOf(width, height) * 0.34f
-        val r = size / 2f
-        val margin = 24f
-        var cx = margin + r
-        val cy = margin + r
-        if (touchX < margin + size + 60 && touchY < margin + size + 60) cx = width - margin - r
+        val w = colorBmp.width
+        val h = colorBmp.height
+        val colorPx = IntArray(w * h)
+        val alphaPx = IntArray(w * h)
+        val strokePx = IntArray(w * h)
 
-        loupePath.reset()
-        loupePath.addCircle(cx, cy, r, Path.Direction.CW)
-        c.save()
-        c.clipPath(loupePath)
-        c.drawColor(viewBg)
-        c.translate(cx, cy)
-        c.scale(2f, 2f)
-        c.translate(-touchX, -touchY)
-        drawContent(c)
-        c.restore()
-        c.drawCircle(cx, cy, r, loupeBorder)
-        drawRing(c, cx, cy, brushPx)
-    }
+        colorBmp.getPixels(colorPx, 0, w, 0, 0, w, h)
+        maskBmp.getPixels(alphaPx, 0, w, 0, 0, w, h)
+        strokeBmp.getPixels(strokePx, 0, w, 0, 0, w, h)
 
-    override fun onDraw(canvas: Canvas) {
-        canvas.drawColor(viewBg)
-        if (src == null) return
-        drawContent(canvas)
-        if (drawing) {
-            drawRing(canvas, touchX, touchY, brushPx / 2f)
-            drawLoupe(canvas)
-        } else if (previewCenter) {
-            drawRing(canvas, width / 2f, height / 2f, brushPx / 2f)
+        var sumR = 0L
+        var sumG = 0L
+        var sumB = 0L
+        var count = 0L
+        val queue = ArrayDeque<Int>()
+        val visited = BooleanArray(w * h)
+
+        for (i in strokePx.indices) {
+            if (((strokePx[i] ushr 24) and 0xFF) > 40) {
+                val c = colorPx[i]
+                sumR += (c shr 16) and 0xFF
+                sumG += (c shr 8) and 0xFF
+                sumB += c and 0xFF
+                count++
+                queue.addLast(i)
+                visited[i] = true
+            }
         }
+        if (count == 0L) return
+
+        val seedR = (sumR / count).toInt()
+        val seedG = (sumG / count).toInt()
+        val seedB = (sumB / count).toInt()
+        val tolerance = 85
+
+        val dirs = intArrayOf(-1, 1, -w, w)
+        while (queue.isNotEmpty()) {
+            val idx = queue.removeFirst()
+            alphaPx[idx] = 0 // เจาะให้โปร่งใส
+            val cx = idx % w
+            for (d in dirs) {
+                val nIdx = idx + d
+                if (nIdx !in 0 until (w * h)) continue
+                val nx = nIdx % w
+                if (abs(cx - nx) > 1) continue
+                if (!visited[nIdx]) {
+                    val nc = colorPx[nIdx]
+                    val nr = (nc shr 16) and 0xFF
+                    val ng = (nc shr 8) and 0xFF
+                    val nb = nc and 0xFF
+                    val diff = abs(seedR - nr) + abs(seedG - ng) + abs(seedB - nb)
+                    if (diff <= tolerance) {
+                        visited[nIdx] = true
+                        queue.addLast(nIdx)
+                    }
+                }
+            }
+        }
+        maskBmp.setPixels(alphaPx, 0, w, 0, 0, w, h)
+    }
+
+    fun hasTransparency(): Boolean {
+        val maskBmp = alphaMaskBmp ?: return false
+        val w = maskBmp.width
+        val h = maskBmp.height
+        val px = IntArray(w * h)
+        maskBmp.getPixels(px, 0, w, 0, 0, w, h)
+        for (p in px) {
+            if (((p ushr 24) and 0xFF) < 250) return true
+        }
+        return false
+    }
+
+    fun getCurrentColorBitmap(): Bitmap? = workingColorBmp?.copy(Bitmap.Config.ARGB_8888, false)
+
+    fun exportFinalBitmap(): Bitmap {
+        val colorBmp = workingColorBmp!!
+        val maskBmp = alphaMaskBmp!!
+        val out = Bitmap.createBitmap(colorBmp.width, colorBmp.height, Bitmap.Config.ARGB_8888)
+        val c = Canvas(out)
+        c.drawBitmap(colorBmp, 0f, 0f, bmpPaint)
+        c.drawBitmap(maskBmp, 0f, 0f, paintMaskDstIn)
+        return out
     }
 }
