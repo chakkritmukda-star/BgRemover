@@ -479,4 +479,82 @@ class MaskEditView(context: Context) : View(context) {
         val strokePx = IntArray(w * h)
 
         colorBmp.getPixels(colorPx, 0, w, 0, 0, w, h)
-        ma
+        maskBmp.getPixels(alphaPx, 0, w, 0, 0, w, h)
+        strokeBmp.getPixels(strokePx, 0, w, 0, 0, w, h)
+
+        var sumR = 0L
+        var sumG = 0L
+        var sumB = 0L
+        var count = 0L
+        val queue = ArrayDeque<Int>()
+        val visited = BooleanArray(w * h)
+
+        for (i in strokePx.indices) {
+            if (((strokePx[i] ushr 24) and 0xFF) > 40) {
+                val c = colorPx[i]
+                sumR += (c shr 16) and 0xFF
+                sumG += (c shr 8) and 0xFF
+                sumB += c and 0xFF
+                count++
+                queue.addLast(i)
+                visited[i] = true
+            }
+        }
+        if (count == 0L) return
+
+        val seedR = (sumR / count).toInt()
+        val seedG = (sumG / count).toInt()
+        val seedB = (sumB / count).toInt()
+        val tolerance = 85
+
+        val dirs = intArrayOf(-1, 1, -w, w)
+        while (queue.isNotEmpty()) {
+            val idx = queue.removeFirst()
+            alphaPx[idx] = 0
+            val cx = idx % w
+            for (d in dirs) {
+                val nIdx = idx + d
+                if (nIdx !in 0 until (w * h)) continue
+                val nx = nIdx % w
+                if (abs(cx - nx) > 1) continue
+                if (!visited[nIdx]) {
+                    val nc = colorPx[nIdx]
+                    val nr = (nc shr 16) and 0xFF
+                    val ng = (nc shr 8) and 0xFF
+                    val nb = nc and 0xFF
+                    val diff = abs(seedR - nr) + abs(seedG - ng) + abs(seedB - nb)
+                    if (diff <= tolerance) {
+                        visited[nIdx] = true
+                        queue.addLast(nIdx)
+                    }
+                }
+            }
+        }
+        maskBmp.setPixels(alphaPx, 0, w, 0, 0, w, h)
+    }
+
+    fun hasTransparency(): Boolean {
+        val maskBmp = alphaMaskBmp ?: return false
+        val w = maskBmp.width
+        val h = maskBmp.height
+        val px = IntArray(w * h)
+        maskBmp.getPixels(px, 0, w, 0, 0, w, h)
+        for (p in px) {
+            if (((p ushr 24) and 0xFF) < 250) return true
+        }
+        return false
+    }
+
+    fun getCurrentColorBitmap(): Bitmap? = workingColorBmp?.copy(Bitmap.Config.ARGB_8888, false)
+
+    fun exportFinalBitmap(): Bitmap {
+        val colorBmp = workingColorBmp!!
+        val maskBmp = alphaMaskBmp!!
+        val out = Bitmap.createBitmap(colorBmp.width, colorBmp.height, Bitmap.Config.ARGB_8888)
+        val c = Canvas(out)
+        c.drawBitmap(colorBmp, 0f, 0f, bmpPaint)
+        c.drawBitmap(maskBmp, 0f, 0f, paintMaskDstIn)
+        return out
+    }
+}
+// END OF MaskEditView.kt
