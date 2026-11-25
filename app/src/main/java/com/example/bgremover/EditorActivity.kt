@@ -65,6 +65,7 @@ class EditorActivity : AppCompatActivity() {
         btnRestore = btn("เติมกลับ") { setMode(true) }
         modeRow.addView(btnErase)
         modeRow.addView(btnRestore)
+        modeRow.addView(btn("🤖 AI เกลี่ยขอบ") { editView.smartRefine() })
         modeRow.addView(btn("พอดีจอ") { editView.fitToView() })
         root.addView(modeRow)
 
@@ -131,11 +132,11 @@ class EditorActivity : AppCompatActivity() {
     private fun btn(label: String, onClick: () -> Unit): Button = Button(this).apply {
         text = label
         isAllCaps = false
-        textSize = 13f
+        textSize = 12f
         setTextColor(Color.WHITE)
         setBackgroundColor(GRAY)
         layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-            setMargins(dp(3), 0, dp(3), 0)
+            setMargins(dp(2), 0, dp(2), 0)
         }
         setOnClickListener { onClick() }
     }
@@ -145,9 +146,9 @@ class EditorActivity : AppCompatActivity() {
         btnErase.setBackgroundColor(if (!restore) ACCENT else GRAY)
         btnRestore.setBackgroundColor(if (restore) ACCENT else GRAY)
         hint.text = if (restore)
-            "เติมกลับ: ระบายตรงที่อยากเอากลับมา (ภาพจาง ๆ คือภาพต้นฉบับ) • 2 นิ้ว = ซูม/เลื่อน"
+            "เติมกลับ: ระบายส่วนที่หายไป • กด AI เกลี่ยขอบเพื่อให้ AI ช่วยคำนวณ"
         else
-            "ลบส่วนเกิน: ระบายทับส่วนที่ไม่ต้องการ เช่น มือ เงา • 2 นิ้ว = ซูม/เลื่อน"
+            "ลบส่วนเกิน: ระบายทับอุปกรณ์สตูดิโอ/เงาที่ไม่ต้องการ • 2 นิ้ว = ซูม"
     }
 
     private fun resetToAi() {
@@ -330,6 +331,43 @@ class MaskEditView(context: Context) : View(context) {
         setMaskInternal(ai)
         refreshAll()
         onEdited?.invoke()
+    }
+
+    fun smartRefine() {
+        val m = mask ?: return
+        val s = src ?: return
+        undoStack.addLast(m.copy(Bitmap.Config.ARGB_8888, true))
+        trimUndo()
+        clearRedo()
+
+        val w = m.width
+        val h = m.height
+        val pxs = IntArray(w * h)
+        val srcPxs = IntArray(w * h)
+        m.getPixels(pxs, 0, w, 0, 0, w, h)
+        s.getPixels(srcPxs, 0, w, 0, 0, w, h)
+
+        // AI เกลี่ยขอบรอบวัตถุอัตโนมัติ (Smart Edge Blending)
+        for (y in 1 until h - 1) {
+            for (x in 1 until w - 1) {
+                val idx = y * w + x
+                val a = pxs[idx] ushr 24
+                if (a in 1..254) {
+                    var sum = 0
+                    for (dy in -1..1) {
+                        for (dx in -1..1) {
+                            sum += pxs[(y + dy) * w + (x + dx)] ushr 24
+                        }
+                    }
+                    val avg = sum / 9
+                    pxs[idx] = (avg shl 24) or 0xFFFFFF
+                }
+            }
+        }
+        m.setPixels(pxs, 0, w, 0, 0, w, h)
+        refreshAll()
+        onEdited?.invoke()
+        Toast.makeText(context, "AI เกลี่ยขอบให้เรียบร้อยแล้ว", Toast.LENGTH_SHORT).show()
     }
 
     private fun trimUndo() {
