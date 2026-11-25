@@ -1,6 +1,7 @@
 package com.example.bgremover
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ContentValues
 import android.content.Intent
 import android.graphics.Bitmap
@@ -21,6 +22,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -36,7 +38,7 @@ class MainActivity : AppCompatActivity() {
     )
 
     private val photoList = mutableListOf<PhotoItem>()
-    private lateinit var adapter: PhotoAdapter
+    private lateinit var photoAdapter: PhotoAdapter
     private lateinit var btnRemove: Button
     private lateinit var btnSaveAll: Button
     private lateinit var btnFastMode: Button
@@ -60,7 +62,7 @@ class MainActivity : AppCompatActivity() {
                         photoList[editingIndex] = item.copy(original = updatedOrig, result = edited)
                     }
                 }
-                adapter.notifyItemChanged(editingIndex)
+                photoAdapter.notifyItemChanged(editingIndex)
                 btnSaveAll.isEnabled = photoList.any { it.result != null }
                 tvStatus.text = "✨ อัปเดตรูปที่ ${editingIndex + 1} เรียบร้อย!"
             }
@@ -77,14 +79,17 @@ class MainActivity : AppCompatActivity() {
                 progressBar.visibility = View.VISIBLE
                 val startIdx = photoList.size
                 val loaded = withContext(Dispatchers.IO) {
+                    AiEngine.warmUp(this@MainActivity, selectedQuality)
                     uris.mapNotNull { uri ->
-                        AiEngine.decodeSmartBitmap(this@MainActivity, uri, maxEdge = 2048)?.let {
-                            PhotoItem(original = it)
-                        }
+                        runCatching {
+                            AiEngine.decodeSmartBitmap(this@MainActivity, uri, maxEdge = 1600)?.let {
+                                PhotoItem(original = it)
+                            }
+                        }.getOrNull()
                     }
                 }
                 photoList.addAll(loaded)
-                adapter.notifyItemRangeInserted(startIdx, loaded.size)
+                photoAdapter.notifyItemRangeInserted(startIdx, loaded.size)
                 progressBar.visibility = View.GONE
                 btnRemove.isEnabled = photoList.isNotEmpty()
                 btnSaveAll.isEnabled = photoList.any { it.result != null }
@@ -95,10 +100,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        lifecycleScope.launch {
-            AiEngine.warmUp(this@MainActivity, selectedQuality)
-        }
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -122,13 +123,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnFastMode = Button(this).apply {
-            text = "⚡ เร็วด่วน (~0.3s)"
+            text = "⚡ เร็วด่วน (~0.4s)"
             textSize = 12.5f
             isAllCaps = false
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                 marginEnd = 8
             }
-            setOnClickListener { updateQualityMode(AiEngine.BgQuality.FAST) }
+            setOnClickListener { updateQualityMode(AiEngine.BgQuality.FAST, warmUpFile = true) }
         }
 
         btnHdMode = Button(this).apply {
@@ -138,15 +139,15 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                 marginStart = 8
             }
-            setOnClickListener { updateQualityMode(AiEngine.BgQuality.HD) }
+            setOnClickListener { updateQualityMode(AiEngine.BgQuality.HD, warmUpFile = true) }
         }
         modeRow.addView(btnFastMode)
         modeRow.addView(btnHdMode)
 
+        photoAdapter = PhotoAdapter()
         val recycler = RecyclerView(this).apply {
             layoutManager = GridLayoutManager(this@MainActivity, 2)
-            adapter = PhotoAdapter()
-            this@MainActivity.adapter = adapter as PhotoAdapter
+            adapter = photoAdapter
             setBackgroundColor(Color.parseColor("#1E293B"))
             setPadding(12, 12, 12, 12)
         }
@@ -182,7 +183,7 @@ class MainActivity : AppCompatActivity() {
             }
             setOnClickListener {
                 photoList.clear()
-                adapter.notifyDataSetChanged()
+                photoAdapter.notifyDataSetChanged()
                 btnRemove.isEnabled = false
                 btnSaveAll.isEnabled = false
                 tvStatus.text = "ล้างรายการเรียบร้อย"
@@ -223,7 +224,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(actionBtnRow)
 
         setContentView(root)
-        updateQualityMode(AiEngine.BgQuality.FAST)
+        updateQualityMode(AiEngine.BgQuality.FAST, warmUpFile = false)
     }
 
     private fun makeRoundedButton(label: String, hexColor: String): Button {
@@ -238,7 +239,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateQualityMode(quality: AiEngine.BgQuality) {
+    private fun updateQualityMode(quality: AiEngine.BgQuality, warmUpFile: Boolean) {
         selectedQuality = quality
         val activeBg = GradientDrawable().apply {
             setColor(Color.parseColor("#7C3AED"))
@@ -254,8 +255,10 @@ class MainActivity : AppCompatActivity() {
         btnFastMode.setTextColor(Color.WHITE)
         btnHdMode.setTextColor(Color.WHITE)
 
-        lifecycleScope.launch {
-            AiEngine.warmUp(this@MainActivity, quality)
+        if (warmUpFile) {
+            lifecycleScope.launch {
+                AiEngine.warmUp(this@MainActivity, quality)
+            }
         }
     }
 
@@ -287,7 +290,7 @@ class MainActivity : AppCompatActivity() {
             for (i in photoList.indices) {
                 val item = photoList[i]
                 item.isProcessing = true
-                adapter.notifyItemChanged(i)
+                photoAdapter.notifyItemChanged(i)
                 tvStatus.text = "กำลังตัดพื้นหลังรูปที่ ${i + 1}/${photoList.size}..."
 
                 try {
@@ -297,20 +300,30 @@ class MainActivity : AppCompatActivity() {
                     item.result = cut
                     item.hasBgRemoved = true
                     item.elapsedMs = SystemClock.elapsedRealtime() - t0
-                } catch (e: Exception) {
-                    Toast.makeText(this@MainActivity, "รูปที่ ${i + 1} ผิดพลาด: ${e.message}", Toast.LENGTH_SHORT).show()
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (t: Throwable) {
+                    showErrorDialog("ตัดพื้นหลังรูปที่ ${i + 1} ไม่สำเร็จ", t)
                 } finally {
                     item.isProcessing = false
                     progressBar.progress = i + 1
-                    adapter.notifyItemChanged(i)
+                    photoAdapter.notifyItemChanged(i)
                 }
             }
             val totalSec = (SystemClock.elapsedRealtime() - batchStart) / 1000f
             progressBar.visibility = View.GONE
             btnRemove.isEnabled = true
             btnSaveAll.isEnabled = photoList.any { it.result != null }
-            tvStatus.text = "✅ ตัดพื้นหลังครบ ${photoList.size} รูป ใน ${"%.2f".format(totalSec)} วินาที! (แตะรูปเพื่อใช้ Magic Eraser ต่อได้)"
+            tvStatus.text = "✅ เสร็จครบ ${photoList.size} รูป ใน ${"%.2f".format(totalSec)} วินาที! (แตะรูปเพื่อใช้ Magic Eraser ต่อได้)"
         }
+    }
+
+    private fun showErrorDialog(titleText: String, t: Throwable) {
+        AlertDialog.Builder(this)
+            .setTitle(titleText)
+            .setMessage(t.localizedMessage ?: t.toString())
+            .setPositiveButton("ตกลง", null)
+            .show()
     }
 
     private fun saveAllImages() {
@@ -458,3 +471,4 @@ class MainActivity : AppCompatActivity() {
         return out
     }
 }
+// END OF MainActivity.kt
