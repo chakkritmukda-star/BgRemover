@@ -45,29 +45,23 @@ object AiEngine {
     private val ortEnv: OrtEnvironment by lazy { OrtEnvironment.getEnvironment() }
     private val sessionMutex = Mutex()
 
-    private var fastBgSession: OrtSession? = null
-    private var hdBgSession: OrtSession? = null
+    private var activeBgQuality: BgQuality? = null
+    private var bgSession: OrtSession? = null
     private var inpaintSession: OrtSession? = null
 
+    /**
+     * เตรียมแตกไฟล์โมเดลไว้ล่วงหน้าแบบปลอดภัย โดยไม่เรียก Native Session ตอนเปิดแอป
+     */
     suspend fun warmUp(context: Context, quality: BgQuality = BgQuality.FAST) {
         withContext(Dispatchers.IO) {
-            runCatching { getBgSession(context.applicationContext, quality) }
-            runCatching { getInpaintSession(context.applicationContext) }
+            runCatching { ensureModelFile(context.applicationContext, quality.assetName) }
         }
     }
 
-    private fun createOptimizedOptions(): OrtSession.SessionOptions {
-        val cores = Runtime.getRuntime().availableProcessors().coerceIn(2, 8)
-        val xnnThreads = (cores - 1).coerceAtLeast(2)
+    private fun createSafeCpuOptions(): OrtSession.SessionOptions {
+        val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
         return OrtSession.SessionOptions().apply {
-            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-            runCatching {
-                addConfigEntry("session.intra_op.allow_spinning", "0")
-                addXnnpack(mapOf("intra_op_num_threads" to xnnThreads.toString()))
-                setIntraOpNumThreads(1)
-            }.onFailure {
-                setIntraOpNumThreads(xnnThreads)
-            }
+            setIntraOpNumThreads(threads)
         }
     }
 
@@ -78,29 +72,32 @@ object AiEngine {
         }.getOrDefault(-1L)
 
         if (!outFile.exists() || outFile.length() < 1024L || (assetLen > 0 && outFile.length() != assetLen)) {
+            val tmpFile = File(context.filesDir, "$assetName.tmp")
             context.assets.open(assetName).use { input ->
-                outFile.outputStream().buffered(256 * 1024).use { output ->
+                tmpFile.outputStream().buffered(256 * 1024).use { output ->
                     input.copyTo(output, 256 * 1024)
                 }
             }
+            if (outFile.exists()) outFile.delete()
+            tmpFile.renameTo(outFile)
         }
         return outFile
     }
 
     private suspend fun getBgSession(context: Context, quality: BgQuality): OrtSession =
         sessionMutex.withLock {
-            when (quality) {
-                BgQuality.FAST -> fastBgSession ?: run {
-                    val file = ensureModelFile(context, quality.assetName)
-                    ortEnv.createSession(file.absolutePath, createOptimizedOptions()).also {
-                        fastBgSession = it
-                    }
-                }
-                BgQuality.HD -> hdBgSession ?: run {
-                    val file = ensureModelFile(context, quality.assetName)
-                    ortEnv.createSession(file.absolutePath, createOptimizedOptions()).also {
-                        hdBgSession = it
-                    }
+            val existing = bgSession
+            if (existing != null && activeBgQuality == quality) {
+                return@withLock existing
+            }
+            runCatching { existing?.close() }
+            bgSession = null
+
+            val file = ensureModelFile(context, quality.assetName)
+            createSafeCpuOptions().use { opts ->
+                ortEnv.createSession(file.absolutePath, opts).also {
+                    bgSession = it
+                    activeBgQuality = quality
                 }
             }
         }
@@ -109,13 +106,15 @@ object AiEngine {
         sessionMutex.withLock {
             inpaintSession ?: run {
                 val file = ensureModelFile(context, "migan.onnx")
-                ortEnv.createSession(file.absolutePath, createOptimizedOptions()).also {
-                    inpaintSession = it
+                createSafeCpuOptions().use { opts ->
+                    ortEnv.createSession(file.absolutePath, opts).also {
+                        inpaintSession = it
+                    }
                 }
             }
         }
 
-    fun decodeSmartBitmap(context: Context, uri: Uri, maxEdge: Int = 2048): Bitmap? {
+    fun decodeSmartBitmap(context: Context, uri: Uri, maxEdge: Int = 1600): Bitmap? {
         val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         context.contentResolver.openInputStream(uri)?.use {
             BitmapFactory.decodeStream(it, null, boundsOpts)
@@ -270,10 +269,6 @@ object AiEngine {
         }
     }
 
-    /**
-     * Magic Eraser แบบ Photoroom ด้วยโมเดล MI-GAN Pipeline v2
-     * ลบวัตถุบริเวณที่ระบายใน strokeBitmap แล้วเติมเนื้อภาพรอบข้างให้เนียนอัตโนมัติ
-     */
     suspend fun magicEraseInpaint(
         context: Context,
         colorSrc: Bitmap,
@@ -301,7 +296,6 @@ object AiEngine {
         }
         if (maxX < minX || maxY < minY) return@withContext colorSrc.copy(Bitmap.Config.ARGB_8888, true)
 
-        // ขยายขอบเขตบริบทรอบจุดที่ระบายเพื่อให้ AI เข้าใจพื้นหลังรอบข้างได้ดีที่สุด
         val boxW = maxX - minX + 1
         val boxH = maxY - minY + 1
         val pad = max(max(boxW, boxH), 192)
@@ -310,7 +304,6 @@ object AiEngine {
         var cropRight = (maxX + pad).coerceAtMost(w)
         var cropBottom = (maxY + pad).coerceAtMost(h)
 
-        // ให้ขนาด Crop ขั้นต่ำใกล้เคียง 512px (ถ้ารูปใหญ่พอ)
         val minCrop = 512
         if (cropRight - cropLeft < minCrop && w >= minCrop) {
             val extra = (minCrop - (cropRight - cropLeft)) / 2
@@ -331,8 +324,7 @@ object AiEngine {
         val cropColor = Bitmap.createBitmap(colorSrc, cropLeft, cropTop, cropW, cropH)
         val cropMaskBmp = Bitmap.createBitmap(strokeBitmap, cropLeft, cropTop, cropW, cropH)
 
-        // จำกัดขนาดส่งเข้าโมเดลไม่เกิน 1024px เพื่อความรวดเร็วระดับเสี้ยววินาที
-        val maxInferEdge = 1024
+        val maxInferEdge = 800
         val inferScale = if (max(cropW, cropH) > maxInferEdge) {
             maxInferEdge.toFloat() / max(cropW, cropH).toFloat()
         } else 1f
@@ -349,7 +341,6 @@ object AiEngine {
         inferColor.getPixels(inPx, 0, inferW, 0, 0, inferW, inferH)
         inferStroke.getPixels(mPx, 0, inferW, 0, 0, inferW, inferH)
 
-        // ขยายขอบ Mask (Dilation 5px) เพื่อเก็บเงาและขอบวัตถุไม่ให้เหลือคราบตกค้าง
         val holeMask = BooleanArray(plane)
         val dilateRadius = 5
         for (y in 0 until inferH) {
@@ -377,7 +368,6 @@ object AiEngine {
             imgBuf.put(i, ((inPx[i] shr 16) and 0xFF).toByte())
             imgBuf.put(plane + i, ((inPx[i] shr 8) and 0xFF).toByte())
             imgBuf.put(plane * 2 + i, (inPx[i] and 0xFF).toByte())
-            // MI-GAN contract: 255 (-1 signed byte) = เก็บภาพเดิม, 0 = บริเวณที่ต้องลบและเติมใหม่
             maskBuf.put(i, if (holeMask[i]) 0.toByte() else 0xFF.toByte())
         }
         imgBuf.rewind()
@@ -420,7 +410,6 @@ object AiEngine {
         if (inferColor !== cropColor) inferColor.recycle()
         if (inferStroke !== cropMaskBmp) inferStroke.recycle()
 
-        // สร้าง Feather Alpha ขอบนุ่มเพื่อให้รอยต่อกลืนไปกับภาพต้นฉบับความละเอียดเต็ม 100%
         val blendMaskSmall = Bitmap.createBitmap(inferW, inferH, Bitmap.Config.ARGB_8888)
         val blendSmallPx = IntArray(plane)
         for (i in 0 until plane) {
@@ -459,3 +448,4 @@ object AiEngine {
         finalBmp
     }
 }
+// END OF AiEngine.kt
