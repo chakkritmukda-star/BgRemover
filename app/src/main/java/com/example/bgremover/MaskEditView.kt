@@ -28,7 +28,7 @@ class MaskEditView(context: Context) : View(context) {
     var mode: Mode = Mode.MAGIC_ERASER
         set(value) {
             field = value
-            clearStrokeOverlay()
+            if (!isBusy) clearStrokeOverlay()
             invalidate()
         }
 
@@ -40,7 +40,7 @@ class MaskEditView(context: Context) : View(context) {
         }
 
     var onHistoryChanged: ((canUndo: Boolean, canRedo: Boolean) -> Unit)? = null
-    var onMagicEraseStrokeFinished: ((strokeMask: Bitmap) -> Unit)? = null
+    var onMagicEraseStrokeFinished: ((strokeMask: Bitmap, bounds: Rect) -> Unit)? = null
 
     private var initialOriginalBmp: Bitmap? = null
     private var workingColorBmp: Bitmap? = null
@@ -64,6 +64,10 @@ class MaskEditView(context: Context) : View(context) {
     private var lastTouchY = 0f
     private var lastImgX = 0f
     private var lastImgY = 0f
+
+    // กรอบของรอยแปรง (พิกัดรูป) ใช้ส่งให้ Magic Eraser แทนการสแกนทั้งภาพ
+    private val strokeBoundsImg = RectF()
+    private var strokeBoundsValid = false
 
     private val undoStack = ArrayDeque<HistorySnapshot>()
     private val redoStack = ArrayDeque<HistorySnapshot>()
@@ -183,11 +187,45 @@ class MaskEditView(context: Context) : View(context) {
         invalidate()
     }
 
+    /** (เดิม) แทนที่รูปสีทั้งใบ */
     fun applyInpaintedBitmap(newColorBmp: Bitmap) {
         workingColorBmp = newColorBmp
         clearStrokeOverlay()
         pushUndoState()
         invalidate()
+    }
+
+    /** อ่านอย่างเดียว ไม่ copy ใช้ตอน busy เท่านั้น */
+    fun colorBitmapForRead(): Bitmap? = workingColorBmp
+
+    /** วางแพตช์ที่ inpaint แล้วลงบนรูปสีโดยตรง (เร็วกว่าแทนทั้งใบ) */
+    fun applyInpaintPatch(patch: Bitmap, left: Int, top: Int) {
+        val c = workingColorBmp ?: return
+        Canvas(c).drawBitmap(patch, left.toFloat(), top.toFloat(), null)
+        clearStrokeOverlay()
+        pushUndoState()
+        invalidate()
+    }
+
+    private fun growStrokeBounds(x: Float, y: Float, r: Float) {
+        if (!strokeBoundsValid) {
+            strokeBoundsImg.set(x - r, y - r, x + r, y + r)
+            strokeBoundsValid = true
+        } else {
+            strokeBoundsImg.union(x - r, y - r, x + r, y + r)
+        }
+    }
+
+    private fun currentStrokeBounds(): Rect? {
+        val bmp = workingColorBmp ?: return null
+        if (!strokeBoundsValid) return null
+        val r = Rect(
+            strokeBoundsImg.left.toInt(),
+            strokeBoundsImg.top.toInt(),
+            strokeBoundsImg.right.toInt() + 1,
+            strokeBoundsImg.bottom.toInt() + 1
+        )
+        return if (r.intersect(0, 0, bmp.width, bmp.height) && !r.isEmpty) r else null
     }
 
     private fun clearStrokeOverlay() {
@@ -402,6 +440,8 @@ class MaskEditView(context: Context) : View(context) {
                 lastImgY = imgY
                 drawPath.reset()
                 drawPath.moveTo(imgX, imgY)
+                strokeBoundsValid = false
+                growStrokeBounds(imgX, imgY, strokeWidthImg / 2f)
                 drawPointOrPath(imgX, imgY, isSingleTap = true)
                 invalidate()
             }
@@ -412,6 +452,7 @@ class MaskEditView(context: Context) : View(context) {
                     lastImgX = imgX
                     lastImgY = imgY
                     drawPath.lineTo(imgX, imgY)
+                    growStrokeBounds(imgX, imgY, strokeWidthImg / 2f)
                     drawPointOrPath(imgX, imgY, isSingleTap = false)
                     invalidate()
                 }
@@ -421,9 +462,12 @@ class MaskEditView(context: Context) : View(context) {
                     isDrawingStroke = false
                     when (mode) {
                         Mode.MAGIC_ERASER -> {
-                            val strokeCopy = strokeOverlayBmp?.copy(Bitmap.Config.ARGB_8888, false)
-                            if (strokeCopy != null) {
-                                onMagicEraseStrokeFinished?.invoke(strokeCopy)
+                            val b = currentStrokeBounds()
+                            val overlay = strokeOverlayBmp
+                            if (b != null && overlay != null) {
+                                onMagicEraseStrokeFinished?.invoke(overlay, b)
+                            } else {
+                                clearStrokeOverlay()
                             }
                         }
                         Mode.SMART_CUTOUT -> {
