@@ -7,7 +7,12 @@ import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import android.graphics.Rect
 import android.net.Uri
 import androidx.exifinterface.media.ExifInterface
 import kotlinx.coroutines.Dispatchers
@@ -20,7 +25,6 @@ import java.nio.ByteOrder
 import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToInt
 
 object BitmapStore {
     var editingOriginal: Bitmap? = null
@@ -42,6 +46,15 @@ object AiEngine {
         HD("model_hd.onnx", 1024)
     }
 
+    /** ผลลัพธ์ Magic Eraser: แพตช์ (ขอบนุ่มด้วย alpha) พร้อมตำแหน่งที่ต้องวางบนรูปเดิม */
+    class InpaintPatch(val patch: Bitmap, val left: Int, val top: Int)
+
+    /** ขนาดอินพุตของ MI-GAN (ตัวแปลง pipeline ส่วนใหญ่ fix ไว้ที่ 512) */
+    private const val INPAINT_SIZE = 512
+
+    /** ลอง XNNPACK (เร็วกว่า CPU ปกติบนหลายเครื่อง) ถ้าเครื่องไหนมีปัญหาให้ตั้งเป็น false */
+    private const val USE_XNNPACK = true
+
     private val ortEnv: OrtEnvironment by lazy { OrtEnvironment.getEnvironment() }
     private val sessionMutex = Mutex()
 
@@ -49,19 +62,55 @@ object AiEngine {
     private var bgSession: OrtSession? = null
     private var inpaintSession: OrtSession? = null
 
-    /**
-     * เตรียมแตกไฟล์โมเดลไว้ล่วงหน้าแบบปลอดภัย โดยไม่เรียก Native Session ตอนเปิดแอป
-     */
+    // ------------------------------------------------------------------
+    // Warm-up: สร้าง session + รันหลอก 1 ครั้ง เพื่อให้การลบจริงครั้งแรกไม่หน่วง
+    // ------------------------------------------------------------------
+
     suspend fun warmUp(context: Context, quality: BgQuality = BgQuality.FAST) {
         withContext(Dispatchers.IO) {
-            runCatching { ensureModelFile(context.applicationContext, quality.assetName) }
+            runCatching {
+                val session = getBgSession(context.applicationContext, quality)
+                if (quality == BgQuality.FAST) {
+                    val size = quality.inputSize
+                    val buf = ByteBuffer.allocateDirect(3 * size * size * 4)
+                        .order(ByteOrder.nativeOrder()).asFloatBuffer()
+                    OnnxTensor.createTensor(ortEnv, buf, longArrayOf(1, 3, size.toLong(), size.toLong())).use { t ->
+                        session.run(mapOf(session.inputNames.first() to t)).close()
+                    }
+                }
+            }
         }
     }
 
-    private fun createSafeCpuOptions(): OrtSession.SessionOptions {
+    suspend fun warmUpInpaint(context: Context) {
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val session = getInpaintSession(context.applicationContext)
+                val area = INPAINT_SIZE * INPAINT_SIZE
+                val img = ByteBuffer.allocateDirect(3 * area).order(ByteOrder.nativeOrder())
+                val mask = ByteBuffer.allocateDirect(area).order(ByteOrder.nativeOrder())
+                for (i in 0 until area) mask.put(i, 0xFF.toByte())
+                runInpaintModel(session, img, mask, INPAINT_SIZE)
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Session
+    // ------------------------------------------------------------------
+
+    private fun createOptions(): OrtSession.SessionOptions {
         val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
         return OrtSession.SessionOptions().apply {
-            setIntraOpNumThreads(threads)
+            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+            var xnn = false
+            if (USE_XNNPACK) {
+                xnn = runCatching {
+                    addXnnpack(mapOf("intra_op_num_threads" to threads.toString()))
+                }.isSuccess
+            }
+            // ถ้าใช้ XNNPACK ให้ thread หลักของ ORT เป็น 1 (XNNPACK จัดการ thread เอง)
+            setIntraOpNumThreads(if (xnn) 1 else threads)
         }
     }
 
@@ -87,14 +136,12 @@ object AiEngine {
     private suspend fun getBgSession(context: Context, quality: BgQuality): OrtSession =
         sessionMutex.withLock {
             val existing = bgSession
-            if (existing != null && activeBgQuality == quality) {
-                return@withLock existing
-            }
+            if (existing != null && activeBgQuality == quality) return@withLock existing
             runCatching { existing?.close() }
             bgSession = null
 
             val file = ensureModelFile(context, quality.assetName)
-            createSafeCpuOptions().use { opts ->
+            createOptions().use { opts ->
                 ortEnv.createSession(file.absolutePath, opts).also {
                     bgSession = it
                     activeBgQuality = quality
@@ -106,13 +153,15 @@ object AiEngine {
         sessionMutex.withLock {
             inpaintSession ?: run {
                 val file = ensureModelFile(context, "migan.onnx")
-                createSafeCpuOptions().use { opts ->
-                    ortEnv.createSession(file.absolutePath, opts).also {
-                        inpaintSession = it
-                    }
+                createOptions().use { opts ->
+                    ortEnv.createSession(file.absolutePath, opts).also { inpaintSession = it }
                 }
             }
         }
+
+    // ------------------------------------------------------------------
+    // Decode
+    // ------------------------------------------------------------------
 
     fun decodeSmartBitmap(context: Context, uri: Uri, maxEdge: Int = 1600): Bitmap? {
         val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -155,11 +204,15 @@ object AiEngine {
             }
             val transformed = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
             if (transformed !== raw) raw.recycle()
-            transformed.copy(Bitmap.Config.ARGB_8888, false)
+            transformed
         } else {
             raw
         }
     }
+
+    // ------------------------------------------------------------------
+    // Remove background
+    // ------------------------------------------------------------------
 
     suspend fun removeBackground(
         context: Context,
@@ -170,41 +223,29 @@ object AiEngine {
         val size = quality.inputSize
         val plane = size * size
 
+        // 1) Preprocess: ย่อ + LUT แทนการหาร/ลบทีละพิกเซล + ลูปเดียว
         val scaled = Bitmap.createScaledBitmap(src, size, size, true)
         val px = IntArray(plane)
         scaled.getPixels(px, 0, size, 0, 0, size, size)
         if (scaled !== src) scaled.recycle()
 
+        val mean = if (quality == BgQuality.FAST) floatArrayOf(0.485f, 0.456f, 0.406f) else floatArrayOf(0.5f, 0.5f, 0.5f)
+        val std = if (quality == BgQuality.FAST) floatArrayOf(0.229f, 0.224f, 0.225f) else floatArrayOf(1f, 1f, 1f)
+        val lut = Array(3) { c -> FloatArray(256) { v -> (v / 255f - mean[c]) / std[c] } }
+
         val floatBuf = ByteBuffer.allocateDirect(3 * plane * 4)
             .order(ByteOrder.nativeOrder())
             .asFloatBuffer()
-
-        if (quality == BgQuality.FAST) {
-            for (i in 0 until plane) {
-                val r = ((px[i] shr 16) and 0xFF) / 255f
-                floatBuf.put(i, (r - 0.485f) / 0.229f)
-            }
-            for (i in 0 until plane) {
-                val g = ((px[i] shr 8) and 0xFF) / 255f
-                floatBuf.put(plane + i, (g - 0.456f) / 0.224f)
-            }
-            for (i in 0 until plane) {
-                val b = (px[i] and 0xFF) / 255f
-                floatBuf.put(plane * 2 + i, (b - 0.406f) / 0.225f)
-            }
-        } else {
-            for (i in 0 until plane) {
-                floatBuf.put(i, (((px[i] shr 16) and 0xFF) / 255f) - 0.5f)
-            }
-            for (i in 0 until plane) {
-                floatBuf.put(plane + i, (((px[i] shr 8) and 0xFF) / 255f) - 0.5f)
-            }
-            for (i in 0 until plane) {
-                floatBuf.put(plane * 2 + i, ((px[i] and 0xFF) / 255f) - 0.5f)
-            }
+        val lutR = lut[0]; val lutG = lut[1]; val lutB = lut[2]
+        for (i in 0 until plane) {
+            val p = px[i]
+            floatBuf.put(i, lutR[(p shr 16) and 0xFF])
+            floatBuf.put(plane + i, lutG[(p shr 8) and 0xFF])
+            floatBuf.put(plane * 2 + i, lutB[p and 0xFF])
         }
         floatBuf.rewind()
 
+        // 2) Inference
         val outMask = FloatArray(plane)
         val inputName = session.inputNames.first()
         OnnxTensor.createTensor(ortEnv, floatBuf, longArrayOf(1, 3, size.toLong(), size.toLong())).use { tensor ->
@@ -216,236 +257,196 @@ object AiEngine {
             }
         }
 
-        var needSigmoid = false
-        for (v in outMask) {
-            if (v < -0.05f || v > 1.05f) {
-                needSigmoid = true
-                break
-            }
-        }
-        if (needSigmoid) {
-            for (i in outMask.indices) {
-                outMask[i] = 1f / (1f + exp(-outMask[i]))
-            }
-        }
-
+        // 3) Normalize mask -> ALPHA_8 (ผ่านรอบเดียว)
         var minV = Float.MAX_VALUE
         var maxV = -Float.MAX_VALUE
         for (v in outMask) {
             if (v < minV) minV = v
             if (v > maxV) maxV = v
         }
-        val range = (maxV - minV).coerceAtLeast(1e-6f)
-
-        val maskSmall = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val maskSmallPx = IntArray(plane)
-        for (i in 0 until plane) {
-            val norm = ((outMask[i] - minV) / range).coerceIn(0f, 1f)
-            val a = (norm * 255f).roundToInt().coerceIn(0, 255)
-            maskSmallPx[i] = a shl 24
+        val needSigmoid = minV < -0.05f || maxV > 1.05f
+        var lo = minV
+        var hi = maxV
+        if (needSigmoid) {
+            lo = 1f / (1f + exp(-lo))
+            hi = 1f / (1f + exp(-hi))
         }
-        maskSmall.setPixels(maskSmallPx, 0, size, 0, 0, size, size)
+        val inv = 255f / (hi - lo).coerceAtLeast(1e-6f)
+        val alphaBytes = ByteArray(plane)
+        for (i in 0 until plane) {
+            val v = if (needSigmoid) 1f / (1f + exp(-outMask[i])) else outMask[i]
+            alphaBytes[i] = ((v - lo) * inv + 0.5f).toInt().coerceIn(0, 255).toByte()
+        }
+        val maskBmp = Bitmap.createBitmap(size, size, Bitmap.Config.ALPHA_8)
+        maskBmp.copyPixelsFromBuffer(ByteBuffer.wrap(alphaBytes))
 
+        // 4) Composite ด้วย Canvas (native) แทนลูปทุกพิกเซลที่ความละเอียดเต็ม
         val w = src.width
         val h = src.height
-        val maskFull = Bitmap.createScaledBitmap(maskSmall, w, h, true)
-        if (maskFull !== maskSmall) maskSmall.recycle()
-
-        val srcPx = IntArray(w * h)
-        val alphaPx = IntArray(w * h)
-        src.getPixels(srcPx, 0, w, 0, 0, w, h)
-        maskFull.getPixels(alphaPx, 0, w, 0, 0, w, h)
-        maskFull.recycle()
-
-        for (i in srcPx.indices) {
-            val origA = (srcPx[i] ushr 24) and 0xFF
-            val maskA = (alphaPx[i] ushr 24) and 0xFF
-            val finalA = (origA * maskA) / 255
-            srcPx[i] = (finalA shl 24) or (srcPx[i] and 0x00FFFFFF)
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawBitmap(src, 0f, 0f, null)
+        val dstIn = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
         }
-
-        Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply {
-            setPixels(srcPx, 0, w, 0, 0, w, h)
-        }
+        canvas.drawBitmap(maskBmp, null, Rect(0, 0, w, h), dstIn)
+        maskBmp.recycle()
+        out
     }
 
-    suspend fun magicEraseInpaint(
+    // ------------------------------------------------------------------
+    // Magic Eraser (local inpaint แบบ PhotoRoom)
+    // ------------------------------------------------------------------
+
+    /**
+     * @param colorSrc   รูปสีปัจจุบัน (ไม่แก้ไขในฟังก์ชันนี้)
+     * @param strokeMask รอยแปรง (alpha > 0 = บริเวณที่จะลบ) ขนาดเท่า colorSrc
+     * @param bounds     กรอบของรอยแปรง (พิกัดรูป) ใช้แทนการสแกนทั้งภาพ
+     * @return แพตช์ที่ blend ขอบแล้ว ให้ drawBitmap ลงที่ (left, top) ได้เลย
+     */
+    suspend fun magicErase(
         context: Context,
         colorSrc: Bitmap,
-        strokeBitmap: Bitmap
-    ): Bitmap = withContext(Dispatchers.Default) {
+        strokeMask: Bitmap,
+        bounds: Rect
+    ): InpaintPatch = withContext(Dispatchers.Default) {
+        val s = INPAINT_SIZE
+        val area = s * s
         val w = colorSrc.width
         val h = colorSrc.height
-        val strokePx = IntArray(w * h)
-        strokeBitmap.getPixels(strokePx, 0, w, 0, 0, w, h)
+        val minSide = min(w, h)
 
-        var minX = w
-        var minY = h
-        var maxX = -1
-        var maxY = -1
+        // 1) สี่เหลี่ยมจัตุรัสรอบรอยแปรง (มี context รอบๆ ให้โมเดลเห็น)
+        val wanted = max(bounds.width(), bounds.height()) * 2 + 96
+        val side = wanted.coerceIn(min(256, minSide), minSide)
+        val left = (bounds.centerX() - side / 2).coerceIn(0, w - side)
+        val top = (bounds.centerY() - side / 2).coerceIn(0, h - side)
+        val srcRect = Rect(left, top, left + side, top + side)
+        val dstRect = Rect(0, 0, s, s)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+
+        // 2) ย่อ/ขยายเป็น 512 ด้วย Canvas ครั้งเดียว (ไม่ต้อง crop แยกก่อน)
+        val img = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+        Canvas(img).drawBitmap(colorSrc, srcRect, dstRect, paint)
+        val msk = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+        Canvas(msk).drawBitmap(strokeMask, srcRect, dstRect, paint)
+
+        val ip = IntArray(area)
+        val mp = IntArray(area)
+        img.getPixels(ip, 0, s, 0, 0, s, s)
+        msk.getPixels(mp, 0, s, 0, 0, s, s)
+        img.recycle()
+        msk.recycle()
+
+        // 3) ขยายรอยแปรงออก (เก็บเงา/ขอบวัตถุ) + เตรียม alpha ขอบนุ่ม
+        val hole = ByteArray(area)
+        for (i in 0 until area) if ((mp[i] ushr 24) > 10) hole[i] = 1
+        val grown = dilate(hole, s, s, 6)
+
+        val imgBuf = ByteBuffer.allocateDirect(3 * area).order(ByteOrder.nativeOrder())
+        val maskBuf = ByteBuffer.allocateDirect(area).order(ByteOrder.nativeOrder())
+        val feather = IntArray(area)
+        for (i in 0 until area) {
+            val c = ip[i]
+            imgBuf.put(i, ((c shr 16) and 0xFF).toByte())
+            imgBuf.put(area + i, ((c shr 8) and 0xFF).toByte())
+            imgBuf.put(2 * area + i, (c and 0xFF).toByte())
+            val isHole = grown[i].toInt() != 0
+            maskBuf.put(i, if (isHole) 0.toByte() else 0xFF.toByte()) // 0 = รูที่ต้องเติม
+            feather[i] = if (isHole) 255 else 0
+        }
+        boxBlur(feather, s, s, 3)
+
+        // 4) Inference
+        val session = getInpaintSession(context.applicationContext)
+        val outBytes = runInpaintModel(session, imgBuf, maskBuf, s)
+
+        // 5) ประกอบแพตช์ ARGB (alpha = feather) แล้วขยายกลับขนาดจริง
+        val outPx = IntArray(area)
+        for (i in 0 until area) {
+            val r = outBytes[i].toInt() and 0xFF
+            val g = outBytes[area + i].toInt() and 0xFF
+            val b = outBytes[2 * area + i].toInt() and 0xFF
+            outPx[i] = (feather[i] shl 24) or (r shl 16) or (g shl 8) or b
+        }
+        val patch512 = Bitmap.createBitmap(outPx, s, s, Bitmap.Config.ARGB_8888)
+        val patch = if (side == s) patch512 else {
+            Bitmap.createScaledBitmap(patch512, side, side, true).also {
+                if (it !== patch512) patch512.recycle()
+            }
+        }
+        InpaintPatch(patch, left, top)
+    }
+
+    private fun runInpaintModel(session: OrtSession, imgBuf: ByteBuffer, maskBuf: ByteBuffer, s: Int): ByteArray {
+        imgBuf.rewind()
+        maskBuf.rewind()
+        val names = session.inputNames.toList()
+        val imgName = names.firstOrNull { it.contains("image", ignoreCase = true) } ?: names[0]
+        val maskName = names.firstOrNull { it.contains("mask", ignoreCase = true) } ?: names[1]
+        val out = ByteArray(3 * s * s)
+        val shapeImg = longArrayOf(1, 3, s.toLong(), s.toLong())
+        val shapeMask = longArrayOf(1, 1, s.toLong(), s.toLong())
+        OnnxTensor.createTensor(ortEnv, imgBuf, shapeImg, OnnxJavaType.UINT8).use { imgT ->
+            OnnxTensor.createTensor(ortEnv, maskBuf, shapeMask, OnnxJavaType.UINT8).use { mT ->
+                session.run(mapOf(imgName to imgT, maskName to mT)).use { res ->
+                    val bb = (res[0] as OnnxTensor).byteBuffer
+                    bb.rewind()
+                    bb.get(out, 0, min(bb.remaining(), out.size))
+                }
+            }
+        }
+        return out
+    }
+
+    /** ขยายพื้นที่ค่า 1 ออก r พิกเซล (แยกแกน X/Y เร็วกว่าทำ 2 มิติตรงๆ มาก) */
+    private fun dilate(src: ByteArray, w: Int, h: Int, r: Int): ByteArray {
+        val tmp = ByteArray(w * h)
         for (y in 0 until h) {
             val row = y * w
             for (x in 0 until w) {
-                if (((strokePx[row + x] ushr 24) and 0xFF) > 20) {
-                    if (x < minX) minX = x
-                    if (x > maxX) maxX = x
-                    if (y < minY) minY = y
-                    if (y > maxY) maxY = y
+                if (src[row + x].toInt() != 0) {
+                    val x0 = max(0, x - r)
+                    val x1 = min(w - 1, x + r)
+                    for (nx in x0..x1) tmp[row + nx] = 1
                 }
             }
         }
-        if (maxX < minX || maxY < minY) return@withContext colorSrc.copy(Bitmap.Config.ARGB_8888, true)
-
-        val boxW = maxX - minX + 1
-        val boxH = maxY - minY + 1
-        val pad = max(max(boxW, boxH), 192)
-        var cropLeft = (minX - pad).coerceAtLeast(0)
-        var cropTop = (minY - pad).coerceAtLeast(0)
-        var cropRight = (maxX + pad).coerceAtMost(w)
-        var cropBottom = (maxY + pad).coerceAtMost(h)
-
-        val minCrop = 512
-        if (cropRight - cropLeft < minCrop && w >= minCrop) {
-            val extra = (minCrop - (cropRight - cropLeft)) / 2
-            cropLeft = (cropLeft - extra).coerceAtLeast(0)
-            cropRight = (cropLeft + minCrop).coerceAtMost(w)
-            cropLeft = (cropRight - minCrop).coerceAtLeast(0)
-        }
-        if (cropBottom - cropTop < minCrop && h >= minCrop) {
-            val extra = (minCrop - (cropBottom - cropTop)) / 2
-            cropTop = (cropTop - extra).coerceAtLeast(0)
-            cropBottom = (cropTop + minCrop).coerceAtMost(h)
-            cropTop = (cropBottom - minCrop).coerceAtLeast(0)
-        }
-
-        val cropW = cropRight - cropLeft
-        val cropH = cropBottom - cropTop
-
-        val cropColor = Bitmap.createBitmap(colorSrc, cropLeft, cropTop, cropW, cropH)
-        val cropMaskBmp = Bitmap.createBitmap(strokeBitmap, cropLeft, cropTop, cropW, cropH)
-
-        val maxInferEdge = 800
-        val inferScale = if (max(cropW, cropH) > maxInferEdge) {
-            maxInferEdge.toFloat() / max(cropW, cropH).toFloat()
-        } else 1f
-
-        val inferW = (cropW * inferScale).roundToInt().coerceAtLeast(64)
-        val inferH = (cropH * inferScale).roundToInt().coerceAtLeast(64)
-
-        val inferColor = if (inferScale < 1f) Bitmap.createScaledBitmap(cropColor, inferW, inferH, true) else cropColor
-        val inferStroke = if (inferScale < 1f) Bitmap.createScaledBitmap(cropMaskBmp, inferW, inferH, true) else cropMaskBmp
-
-        val plane = inferW * inferH
-        val inPx = IntArray(plane)
-        val mPx = IntArray(plane)
-        inferColor.getPixels(inPx, 0, inferW, 0, 0, inferW, inferH)
-        inferStroke.getPixels(mPx, 0, inferW, 0, 0, inferW, inferH)
-
-        val holeMask = BooleanArray(plane)
-        val dilateRadius = 5
-        for (y in 0 until inferH) {
-            val row = y * inferW
-            for (x in 0 until inferW) {
-                if (((mPx[row + x] ushr 24) and 0xFF) > 20) {
-                    val y0 = (y - dilateRadius).coerceAtLeast(0)
-                    val y1 = (y + dilateRadius).coerceAtMost(inferH - 1)
-                    val x0 = (x - dilateRadius).coerceAtLeast(0)
-                    val x1 = (x + dilateRadius).coerceAtMost(inferW - 1)
-                    for (ny in y0..y1) {
-                        val nrow = ny * inferW
-                        for (nx in x0..x1) {
-                            holeMask[nrow + nx] = true
-                        }
-                    }
+        val out = ByteArray(w * h)
+        for (y in 0 until h) {
+            val row = y * w
+            for (x in 0 until w) {
+                if (tmp[row + x].toInt() != 0) {
+                    val y0 = max(0, y - r)
+                    val y1 = min(h - 1, y + r)
+                    for (ny in y0..y1) out[ny * w + x] = 1
                 }
             }
         }
+        return out
+    }
 
-        val imgBuf = ByteBuffer.allocateDirect(3 * plane).order(ByteOrder.nativeOrder())
-        val maskBuf = ByteBuffer.allocateDirect(plane).order(ByteOrder.nativeOrder())
-
-        for (i in 0 until plane) {
-            imgBuf.put(i, ((inPx[i] shr 16) and 0xFF).toByte())
-            imgBuf.put(plane + i, ((inPx[i] shr 8) and 0xFF).toByte())
-            imgBuf.put(plane * 2 + i, (inPx[i] and 0xFF).toByte())
-            maskBuf.put(i, if (holeMask[i]) 0.toByte() else 0xFF.toByte())
-        }
-        imgBuf.rewind()
-        maskBuf.rewind()
-
-        val session = getInpaintSession(context.applicationContext)
-        val names = session.inputNames.toList()
-        val imgInputName = names.firstOrNull { it.contains("image", ignoreCase = true) } ?: names.getOrElse(0) { "image" }
-        val maskInputName = names.firstOrNull { it.contains("mask", ignoreCase = true) } ?: names.getOrElse(1) { "mask" }
-
-        val outBytes = ByteArray(3 * plane)
-        OnnxTensor.createTensor(ortEnv, imgBuf, longArrayOf(1, 3, inferH.toLong(), inferW.toLong()), OnnxJavaType.UINT8).use { imgTensor ->
-            OnnxTensor.createTensor(ortEnv, maskBuf, longArrayOf(1, 1, inferH.toLong(), inferW.toLong()), OnnxJavaType.UINT8).use { mTensor ->
-                session.run(mapOf(imgInputName to imgTensor, maskInputName to mTensor)).use { res ->
-                    val outTensor = res[0] as OnnxTensor
-                    val outBb = outTensor.byteBuffer
-                    outBb.rewind()
-                    outBb.get(outBytes, 0, min(outBb.remaining(), outBytes.size))
-                }
+    /** Box blur แยกแกน (running sum) ปรับค่าใน a โดยตรง */
+    private fun boxBlur(a: IntArray, w: Int, h: Int, r: Int) {
+        val tmp = IntArray(w * h)
+        val d = 2 * r + 1
+        for (y in 0 until h) {
+            val row = y * w
+            var sum = 0
+            for (x in -r..r) sum += a[row + x.coerceIn(0, w - 1)]
+            for (x in 0 until w) {
+                tmp[row + x] = sum / d
+                sum += a[row + min(x + r + 1, w - 1)] - a[row + max(x - r, 0)]
             }
         }
-
-        val inferOutPx = IntArray(plane)
-        for (i in 0 until plane) {
-            val r = outBytes[i].toInt() and 0xFF
-            val g = outBytes[plane + i].toInt() and 0xFF
-            val b = outBytes[plane * 2 + i].toInt() and 0xFF
-            inferOutPx[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-        }
-
-        val inpaintedInferBmp = Bitmap.createBitmap(inferW, inferH, Bitmap.Config.ARGB_8888).apply {
-            setPixels(inferOutPx, 0, inferW, 0, 0, inferW, inferH)
-        }
-        val inpaintedCropBmp = if (inferScale < 1f) {
-            Bitmap.createScaledBitmap(inpaintedInferBmp, cropW, cropH, true).also {
-                if (it !== inpaintedInferBmp) inpaintedInferBmp.recycle()
-            }
-        } else inpaintedInferBmp
-
-        if (inferColor !== cropColor) inferColor.recycle()
-        if (inferStroke !== cropMaskBmp) inferStroke.recycle()
-
-        val blendMaskSmall = Bitmap.createBitmap(inferW, inferH, Bitmap.Config.ARGB_8888)
-        val blendSmallPx = IntArray(plane)
-        for (i in 0 until plane) {
-            blendSmallPx[i] = if (holeMask[i]) (0xFF shl 24) else 0
-        }
-        blendMaskSmall.setPixels(blendSmallPx, 0, inferW, 0, 0, inferW, inferH)
-        val blendMaskCrop = Bitmap.createScaledBitmap(blendMaskSmall, cropW, cropH, true)
-        if (blendMaskCrop !== blendMaskSmall) blendMaskSmall.recycle()
-
-        val origCropPx = IntArray(cropW * cropH)
-        val newCropPx = IntArray(cropW * cropH)
-        val blendPx = IntArray(cropW * cropH)
-        cropColor.getPixels(origCropPx, 0, cropW, 0, 0, cropW, cropH)
-        inpaintedCropBmp.getPixels(newCropPx, 0, cropW, 0, 0, cropW, cropH)
-        blendMaskCrop.getPixels(blendPx, 0, cropW, 0, 0, cropW, cropH)
-
-        for (i in origCropPx.indices) {
-            val a = (blendPx[i] ushr 24) and 0xFF
-            if (a > 0) {
-                val orig = origCropPx[i]
-                val rep = newCropPx[i]
-                val r = (((rep shr 16) and 0xFF) * a + ((orig shr 16) and 0xFF) * (255 - a)) / 255
-                val g = (((rep shr 8) and 0xFF) * a + ((orig shr 8) and 0xFF) * (255 - a)) / 255
-                val b = ((rep and 0xFF) * a + (orig and 0xFF) * (255 - a)) / 255
-                origCropPx[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+        for (x in 0 until w) {
+            var sum = 0
+            for (y in -r..r) sum += tmp[y.coerceIn(0, h - 1) * w + x]
+            for (y in 0 until h) {
+                a[y * w + x] = sum / d
+                sum += tmp[min(y + r + 1, h - 1) * w + x] - tmp[max(y - r, 0) * w + x]
             }
         }
-
-        cropColor.recycle()
-        cropMaskBmp.recycle()
-        inpaintedCropBmp.recycle()
-        blendMaskCrop.recycle()
-
-        val finalBmp = colorSrc.copy(Bitmap.Config.ARGB_8888, true)
-        finalBmp.setPixels(origCropPx, 0, cropW, cropLeft, cropTop, cropW, cropH)
-        finalBmp
     }
 }
 // END OF AiEngine.kt
