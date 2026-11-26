@@ -24,6 +24,8 @@ import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -78,14 +80,21 @@ class MainActivity : AppCompatActivity() {
                 tvStatus.text = "กำลังเตรียมรูปภาพ ${uris.size} รูป..."
                 progressBar.visibility = View.VISIBLE
                 val startIdx = photoList.size
+
+                // โหลดโมเดลไปพร้อมกับการถอดรหัสรูป ไม่ต้องรอกัน
+                launch { AiEngine.warmUp(this@MainActivity, selectedQuality) }
+
+                // ถอดรหัสรูปแบบขนานทีละ 3 รูป (กัน RAM พุ่ง)
                 val loaded = withContext(Dispatchers.IO) {
-                    AiEngine.warmUp(this@MainActivity, selectedQuality)
-                    uris.mapNotNull { uri ->
-                        runCatching {
-                            AiEngine.decodeSmartBitmap(this@MainActivity, uri, maxEdge = 1600)?.let {
-                                PhotoItem(original = it)
+                    uris.chunked(3).flatMap { chunk ->
+                        chunk.map { uri ->
+                            async {
+                                runCatching {
+                                    AiEngine.decodeSmartBitmap(this@MainActivity, uri, maxEdge = 1600)
+                                        ?.let { PhotoItem(original = it) }
+                                }.getOrNull()
                             }
-                        }.getOrNull()
+                        }.awaitAll().filterNotNull()
                     }
                 }
                 photoList.addAll(loaded)
