@@ -1,7 +1,9 @@
 package com.example.bgremover
 
 import android.app.Activity
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.view.Gravity
@@ -41,8 +43,9 @@ class EditorActivity : AppCompatActivity() {
             return
         }
 
+        // เตรียมโมเดล Magic Eraser ล่วงหน้า (สร้าง session + รันหลอก 1 ครั้ง)
         lifecycleScope.launch {
-            AiEngine.warmUp(this@EditorActivity)
+            AiEngine.warmUpInpaint(this@EditorActivity)
         }
 
         val root = LinearLayout(this).apply {
@@ -109,20 +112,21 @@ class EditorActivity : AppCompatActivity() {
                 btnUndo.alpha = if (canU) 1f else 0.4f
                 btnRedo.alpha = if (canR) 1f else 0.4f
             }
-            onMagicEraseStrokeFinished = { strokeMask ->
-                runMagicEraserInpaint(strokeMask)
+            onMagicEraseStrokeFinished = { strokeMask, bounds ->
+                runMagicEraserInpaint(strokeMask, bounds)
             }
         }
 
         loadingOverlay = FrameLayout(this).apply {
-            setBackgroundColor(Color.parseColor("#880F172A"))
+            // จางลงจากเดิม เพื่อให้เห็นรอยแปรงสีม่วงระหว่างประมวลผล
+            setBackgroundColor(Color.parseColor("#330F172A"))
             visibility = View.GONE
             val box = LinearLayout(this@EditorActivity).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
                 setPadding(48, 36, 48, 36)
                 background = GradientDrawable().apply {
-                    setColor(Color.parseColor("#1E293B"))
+                    setColor(Color.parseColor("#E61E293B"))
                     cornerRadius = 32f
                 }
                 layoutParams = FrameLayout.LayoutParams(
@@ -219,24 +223,24 @@ class EditorActivity : AppCompatActivity() {
         selectMode(if (startMagic) MaskEditView.Mode.MAGIC_ERASER else MaskEditView.Mode.ERASE_MANUAL)
     }
 
-    private fun runMagicEraserInpaint(strokeMask: android.graphics.Bitmap) {
-        val currentColor = editView.getCurrentColorBitmap() ?: run {
-            strokeMask.recycle()
-            return
-        }
+    /**
+     * Magic Eraser: inpaint เฉพาะบริเวณรอบรอยแปรง แล้ววางแพตช์กลับลงรูปโดยตรง
+     * หมายเหตุ: strokeMask คือ overlay ของ View ห้าม recycle ที่นี่
+     */
+    private fun runMagicEraserInpaint(strokeMask: Bitmap, bounds: Rect) {
+        val color = editView.colorBitmapForRead() ?: return
         editView.setProcessingBusy(true)
         tvLoadingMsg.text = "✨ Magic Eraser กำลังลบวัตถุให้เนียน..."
         loadingOverlay.visibility = View.VISIBLE
 
         lifecycleScope.launch {
             try {
-                val inpainted = AiEngine.magicEraseInpaint(this@EditorActivity, currentColor, strokeMask)
-                editView.applyInpaintedBitmap(inpainted)
+                val r = AiEngine.magicErase(this@EditorActivity, color, strokeMask, bounds)
+                editView.applyInpaintPatch(r.patch, r.left, r.top)
+                r.patch.recycle()
             } catch (e: Exception) {
                 Toast.makeText(this@EditorActivity, "Magic Eraser ผิดพลาด: ${e.message}", Toast.LENGTH_LONG).show()
             } finally {
-                currentColor.recycle()
-                strokeMask.recycle()
                 loadingOverlay.visibility = View.GONE
                 editView.setProcessingBusy(false)
             }
@@ -316,3 +320,4 @@ class EditorActivity : AppCompatActivity() {
         }
     }
 }
+// END OF EditorActivity.kt
