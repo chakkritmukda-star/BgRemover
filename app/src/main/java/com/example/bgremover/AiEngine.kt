@@ -53,7 +53,7 @@ object AiEngine {
     private const val INPAINT_SIZE = 512
 
     /** ลอง XNNPACK (เร็วกว่า CPU ปกติบนหลายเครื่อง) ถ้าเครื่องไหนมีปัญหาให้ตั้งเป็น false */
-    private const val USE_XNNPACK = true
+    private const val USE_XNNPACK = false
 
     private val ortEnv: OrtEnvironment by lazy { OrtEnvironment.getEnvironment() }
     private val sessionMutex = Mutex()
@@ -63,35 +63,18 @@ object AiEngine {
     private var inpaintSession: OrtSession? = null
 
     // ------------------------------------------------------------------
-    // Warm-up: สร้าง session + รันหลอก 1 ครั้ง เพื่อให้การลบจริงครั้งแรกไม่หน่วง
+    // Warm-up: แตกไฟล์โมเดลไว้ล่วงหน้าเท่านั้น (ไม่เรียก Native Session เพื่อกันแอปเด้ง)
     // ------------------------------------------------------------------
 
     suspend fun warmUp(context: Context, quality: BgQuality = BgQuality.FAST) {
         withContext(Dispatchers.IO) {
-            runCatching {
-                val session = getBgSession(context.applicationContext, quality)
-                if (quality == BgQuality.FAST) {
-                    val size = quality.inputSize
-                    val buf = ByteBuffer.allocateDirect(3 * size * size * 4)
-                        .order(ByteOrder.nativeOrder()).asFloatBuffer()
-                    OnnxTensor.createTensor(ortEnv, buf, longArrayOf(1, 3, size.toLong(), size.toLong())).use { t ->
-                        session.run(mapOf(session.inputNames.first() to t)).close()
-                    }
-                }
-            }
+            runCatching { ensureModelFile(context.applicationContext, quality.assetName) }
         }
     }
 
     suspend fun warmUpInpaint(context: Context) {
         withContext(Dispatchers.IO) {
-            runCatching {
-                val session = getInpaintSession(context.applicationContext)
-                val area = INPAINT_SIZE * INPAINT_SIZE
-                val img = ByteBuffer.allocateDirect(3 * area).order(ByteOrder.nativeOrder())
-                val mask = ByteBuffer.allocateDirect(area).order(ByteOrder.nativeOrder())
-                for (i in 0 until area) mask.put(i, 0xFF.toByte())
-                runInpaintModel(session, img, mask, INPAINT_SIZE)
-            }
+            runCatching { ensureModelFile(context.applicationContext, "migan.onnx") }
         }
     }
 
